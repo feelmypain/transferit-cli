@@ -1,0 +1,24 @@
+# Build outputs
+/transferit
+/transferit.exe
+*.test
+*.out
+
+# Archives and packaged releases
+*.zip
+*.tar
+*.tar.gz
+
+# Local config, credentials, and environment files
+.env
+.env.*
+config.json
+*.secret
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
