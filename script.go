@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -170,6 +171,7 @@ Upload options:
   --account-password PASS   MEGA account password for one-shot account login during upload
   --account-mfa CODE        MEGA account two-factor authentication code
   --save-account-password   save the account password when logging in during upload
+  --upload-workers N        parallel upload chunk workers; default 4
 
 Examples:
   go run script.go https://transfer.it/t/TRANSFER_HANDLE --password YOUR_LINK_PASSWORD
@@ -586,6 +588,7 @@ func runUpload(args []string) error {
 	accountPassword := fs.String("account-password", "", "MEGA account password for one-shot login")
 	accountMFA := fs.String("account-mfa", "", "MEGA account two-factor code")
 	saveAccountPassword := fs.Bool("save-account-password", false, "save account password when logging in during upload")
+	uploadWorkers := fs.Int("upload-workers", 4, "parallel upload chunk workers")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -594,6 +597,9 @@ func runUpload(args []string) error {
 	}
 	if *expire != 0 && *expire != 7 && *expire != 30 && *expire != 90 {
 		return errors.New("--expire must be one of 0, 7, 30, or 90")
+	}
+	if *uploadWorkers < 1 || *uploadWorkers > 16 {
+		return errors.New("--upload-workers must be between 1 and 16")
 	}
 
 	paths := fs.Args()
@@ -652,7 +658,7 @@ func runUpload(args []string) error {
 		if parent == "" {
 			return fmt.Errorf("missing remote parent folder for %s", item.Rel)
 		}
-		res, err := uploadFile(tapi, parent, item.Source, pathpkg.Base(item.Rel), item.Rel)
+		res, err := uploadFile(tapi, parent, item.Source, pathpkg.Base(item.Rel), item.Rel, *uploadWorkers)
 		if err != nil {
 			return err
 		}
@@ -1294,7 +1300,7 @@ func createRemoteFolder(api *apiClient, parent, name string) (string, error) {
 	return xpRes[0].F[0].H, nil
 }
 
-func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string) (uploadResult, error) {
+func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, uploadWorkers int) (uploadResult, error) {
 	st, err := os.Stat(filePath)
 	if err != nil {
 		return uploadResult{}, err
@@ -1325,37 +1331,10 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string) 
 	if len(chunks) == 0 {
 		chunks = []chunkSize{{position: 0, size: 0}}
 	}
-	macs := make([][]byte, len(chunks))
-	completion := ""
-	start := time.Now()
-	var uploaded int64
-	nextPrint := time.Now()
-
 	fmt.Printf("Uploading %s (%d bytes)\n", displayPath, size)
-	for i, ch := range chunks {
-		buf := make([]byte, ch.size)
-		if ch.size > 0 {
-			if _, err := f.ReadAt(buf, ch.position); err != nil {
-				return uploadResult{}, err
-			}
-		}
-		encData, mac, err := encryptUploadChunk(buf, ukey, ch.position)
-		if err != nil {
-			return uploadResult{}, err
-		}
-		body, err := postUploadChunk(upRes[0].P, ch.position, encData)
-		if err != nil {
-			return uploadResult{}, err
-		}
-		if len(body) > 0 {
-			completion = string(body)
-		}
-		macs[i] = mac
-		uploaded += int64(ch.size)
-		if time.Now().After(nextPrint) || uploaded == size {
-			printProgress(uploaded, size, start)
-			nextPrint = time.Now().Add(time.Second)
-		}
+	completion, macs, err := uploadChunks(f, upRes[0].P, ukey, chunks, size, uploadWorkers, postUploadChunk)
+	if err != nil {
+		return uploadResult{}, err
 	}
 	fmt.Println()
 	if completion == "" {
@@ -1388,6 +1367,129 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string) 
 		return uploadResult{}, fmt.Errorf("unexpected xp response: %+v", xpRes)
 	}
 	return uploadResult{Handle: xpRes[0].F[0].H, Name: remoteName, Path: displayPath, Size: size}, nil
+}
+
+type uploadChunkPoster func(uploadURL string, offset int64, data []byte) ([]byte, error)
+
+type uploadChunkResult struct {
+	index int
+	size  int
+	body  []byte
+	mac   []byte
+	err   error
+}
+
+func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunkSize, total int64, workers int, poster uploadChunkPoster) (string, [][]byte, error) {
+	if len(chunks) == 0 {
+		return "", nil, nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	macs := make([][]byte, len(chunks))
+	completion := ""
+	start := time.Now()
+	var uploaded int64
+	nextPrint := time.Now()
+	reportProgress := func(size int) {
+		uploaded += int64(size)
+		if time.Now().After(nextPrint) || uploaded == total {
+			printProgress(uploaded, total, start)
+			nextPrint = time.Now().Add(time.Second)
+		}
+	}
+
+	last := len(chunks) - 1
+	if workers == 1 || last == 0 {
+		for index := 0; index <= last; index++ {
+			res := uploadOneChunk(r, uploadURL, ukey, chunks, index, poster)
+			if res.err != nil {
+				return "", nil, fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
+			}
+			macs[res.index] = res.mac
+			if len(res.body) > 0 {
+				completion = string(res.body)
+			}
+			reportProgress(res.size)
+		}
+		return completion, macs, nil
+	}
+
+	workerCount := minInt(workers, last)
+	jobs := make(chan int)
+	results := make(chan uploadChunkResult, workerCount)
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results <- uploadOneChunk(r, uploadURL, ukey, chunks, index, poster)
+			}
+		}()
+	}
+	go func() {
+		for index := 0; index < last; index++ {
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
+			}
+			continue
+		}
+		macs[res.index] = res.mac
+		if len(res.body) > 0 {
+			completion = string(res.body)
+		}
+		reportProgress(res.size)
+	}
+	if firstErr != nil {
+		return "", nil, firstErr
+	}
+
+	res := uploadOneChunk(r, uploadURL, ukey, chunks, last, poster)
+	if res.err != nil {
+		return "", nil, fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
+	}
+	macs[res.index] = res.mac
+	if len(res.body) > 0 {
+		completion = string(res.body)
+	}
+	reportProgress(res.size)
+	return completion, macs, nil
+}
+
+func uploadOneChunk(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunkSize, index int, poster uploadChunkPoster) uploadChunkResult {
+	ch := chunks[index]
+	res := uploadChunkResult{index: index, size: ch.size}
+	buf := make([]byte, ch.size)
+	if ch.size > 0 {
+		if _, err := r.ReadAt(buf, ch.position); err != nil {
+			res.err = err
+			return res
+		}
+	}
+	encData, mac, err := encryptUploadChunk(buf, ukey, ch.position)
+	if err != nil {
+		res.err = err
+		return res
+	}
+	body, err := poster(uploadURL, ch.position, encData)
+	if err != nil {
+		res.err = err
+		return res
+	}
+	res.body = body
+	res.mac = mac
+	return res
 }
 
 type transferOptions struct {

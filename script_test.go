@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseTransferHandle(t *testing.T) {
@@ -67,6 +70,87 @@ func TestAttributeRoundTrip(t *testing.T) {
 	}
 	if name != "file-name.bin" {
 		t.Fatalf("file attr name = %q", name)
+	}
+}
+
+func TestUploadChunksKeepsFinalChunkLast(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 3*1024*1024)
+	chunks := getChunkSizes(int64(len(data)))
+	if len(chunks) < 3 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	finalOffset := chunks[len(chunks)-1].position
+	ukey := []uint32{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718}
+
+	var mu sync.Mutex
+	var offsets []int64
+	poster := func(_ string, offset int64, encrypted []byte) ([]byte, error) {
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+		offsets = append(offsets, offset)
+		mu.Unlock()
+		if offset == finalOffset {
+			return []byte("completion-handle"), nil
+		}
+		return nil, nil
+	}
+
+	completion, macs, err := uploadChunks(bytes.NewReader(data), "https://upload.example", ukey, chunks, int64(len(data)), 4, poster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion != "completion-handle" {
+		t.Fatalf("completion = %q", completion)
+	}
+	if len(macs) != len(chunks) {
+		t.Fatalf("mac count = %d, want %d", len(macs), len(chunks))
+	}
+	for i, mac := range macs {
+		if len(mac) != 16 {
+			t.Fatalf("mac %d length = %d, want 16", i, len(mac))
+		}
+	}
+
+	mu.Lock()
+	gotCount := len(offsets)
+	gotLast := offsets[len(offsets)-1]
+	mu.Unlock()
+	if gotCount != len(chunks) {
+		t.Fatalf("posted %d chunks, want %d", gotCount, len(chunks))
+	}
+	if gotLast != finalOffset {
+		t.Fatalf("last posted offset = %d, want final offset %d", gotLast, finalOffset)
+	}
+}
+
+func TestUploadChunksSequentialWorkerPostsEveryChunk(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 3*1024*1024)
+	chunks := getChunkSizes(int64(len(data)))
+	ukey := []uint32{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718}
+
+	var offsets []int64
+	poster := func(_ string, offset int64, encrypted []byte) ([]byte, error) {
+		offsets = append(offsets, offset)
+		if offset == chunks[len(chunks)-1].position {
+			return []byte("completion-handle"), nil
+		}
+		return nil, nil
+	}
+
+	completion, _, err := uploadChunks(bytes.NewReader(data), "https://upload.example", ukey, chunks, int64(len(data)), 1, poster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion != "completion-handle" {
+		t.Fatalf("completion = %q", completion)
+	}
+	if len(offsets) != len(chunks) {
+		t.Fatalf("posted %d chunks, want %d", len(offsets), len(chunks))
+	}
+	for i, ch := range chunks {
+		if offsets[i] != ch.position {
+			t.Fatalf("posted offset %d = %d, want %d", i, offsets[i], ch.position)
+		}
 	}
 }
 

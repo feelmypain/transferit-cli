@@ -991,16 +991,18 @@ For an empty file, this implementation sends one zero-length chunk at offset
 `0`. The upload server still returns a completion handle for the final chunk.
 
 Intermediate chunk responses are usually empty. The final chunk response body
-contains a completion handle. That handle is later supplied as the file node
-`h` in `xp`.
+contains a completion handle. This CLI may upload non-final chunks in parallel,
+but it waits to POST the final chunk until the earlier chunks complete so that
+the completion handle is returned predictably. That handle is later supplied as
+the file node `h` in `xp`.
 
 Completion handles are URL-safe token strings and can begin with `-`. Do not
 treat every upload response body starting with `-` as an error. Treat it as an
 API error only when the whole response body is a negative integer, such as
 `-3`.
 
-Implemented by `getChunkSizes`, `postUploadChunk`, and `uploadFile` in
-`script.go`.
+Implemented by `getChunkSizes`, `uploadChunks`, `postUploadChunk`, and
+`uploadFile` in `script.go`.
 
 ### File Upload Encryption
 

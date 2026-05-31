@@ -167,6 +167,7 @@ Upload options:
 | `--account-password PASS` | MEGA account password for one-shot login during upload. | Saved password or prompt |
 | `--account-mfa CODE` | MEGA two-factor authentication code, if required. | Empty |
 | `--save-account-password` | Save the account password when logging in during upload. | Disabled |
+| `--upload-workers N` | Parallel upload chunk workers per file. Use `1` for strictly sequential uploads. | `4` |
 
 Examples:
 
@@ -213,7 +214,8 @@ Examples:
 - Every local directory is created as a remote folder node, including empty
   directories.
 - Every regular file is encrypted locally and uploaded into its matching remote
-  folder.
+  folder. Upload chunks are posted in parallel by default; the final chunk is
+  still sent last so the upload server can return the completion handle.
 - Special files such as devices, sockets, and symlinks are rejected.
 - After all files are uploaded, transfer metadata is applied:
   - title
