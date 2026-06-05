@@ -95,8 +95,9 @@ Sometimes a command result inside the response array is negative:
 [-14]
 ```
 
-The implementation treats any negative result as failure unless the endpoint is
-known to return `0` for success.
+The implementation treats a bare negative body, or a negative first command
+result inside a response array, as failure unless the endpoint is known to
+return `0` for success.
 
 Observed or useful error meanings:
 
@@ -111,8 +112,9 @@ Observed or useful error meanings:
 The API may return other negative codes. The safest implementation strategy is
 to surface the raw code and the command that caused it.
 
-The CLI retries retryable API codes `-3` and `-4`, plus HTTP `429`, `500`,
-`502`, `503`, and `504`, with bounded exponential backoff.
+The CLI retries retryable API codes `-3` and `-4` whether they appear as a bare
+body (`-3`) or as the first command result (`[-3]`). It also retries HTTP
+`429`, `500`, `502`, `503`, and `504`, with bounded exponential backoff.
 
 ### Hashcash / HTTP 402 During Login
 
@@ -519,8 +521,16 @@ Important behavior:
 - The response body is plaintext file data for transfer.it downloads. This is
   different from the lower-level MEGA file download model where clients often
   decrypt encrypted chunks themselves.
+- After writing the file, the CLI recomputes the MEGA-style per-chunk MAC and
+  final meta MAC from the plaintext bytes and the file node key. If verification
+  fails after a resumed download, it retries once from byte 0. A same-size
+  existing file is skipped only if this MAC verification succeeds.
+- Browser downloads through the transfer.it web app can fail for reasons that
+  do not affect this direct endpoint, especially when using VPN exit nodes that
+  trigger transfer.it or MEGA edge anti-abuse/rate-limit behavior.
 
-Implemented by `downloadNode` in `script.go`.
+Implemented by `downloadNode`, `downloadNodeBytes`, and `verifyDownloadedFile`
+in `script.go`.
 
 ## Upload API
 

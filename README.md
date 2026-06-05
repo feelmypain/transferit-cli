@@ -137,8 +137,11 @@ Examples:
 - It derives the transfer password token when `--password` is supplied.
 - It decrypts node attributes locally to recover real file and folder names.
 - It downloads file content through the transfer.it direct download endpoint.
-- Existing complete files are skipped.
-- Existing partial files are resumed with an HTTP `Range` request.
+- Downloaded files are verified against the MEGA-style file MAC stored in the
+  node key.
+- Existing complete files are skipped only after integrity verification.
+- Existing partial files are resumed with an HTTP `Range` request. If integrity
+  verification fails after resume, the file is downloaded again from byte 0.
 - Multi-file or directory transfers are placed inside a subdirectory named after
   the transfer title.
 - Empty folders are recreated when downloading directory transfers.
@@ -355,7 +358,7 @@ Downloads:
 - Show percentage, transferred bytes, total bytes, and current average speed.
 - Resume partial files if the destination file already exists and is smaller
   than the remote size.
-- Skip files that already match the remote byte size.
+- Verify same-size existing files before skipping them.
 
 Uploads:
 
@@ -424,8 +427,6 @@ Upload flow:
 
 - Upload resume is not implemented.
 - Symlinks and special files are not followed or uploaded.
-- Directory downloads recreate empty folders, but downloads still skip files
-  based only on byte size, not hash.
 - Prebuilt binaries are not committed by default. Build locally with
   `go build -o transferit script.go`, or publish binaries separately through
   GitHub Releases.
@@ -442,6 +443,15 @@ Upload flow:
 
 : The transfer may have expired, been removed, or transfer.it may have changed
   its direct download behavior.
+
+Web page opens but browser download fails
+
+: The web interface uses transfer.it's browser client and edge/API path, which
+  can behave differently from this CLI's direct download endpoint. VPN exit
+  nodes can trigger anti-abuse, rate-limit, blocked-region, or bad-edge
+  behavior in the web app. Try the same link without the VPN, with a different
+  VPN region, or in a clean browser profile. If the CLI downloads and verifies
+  the file, the uploaded file bytes and node key are valid.
 
 `API error -14`
 
