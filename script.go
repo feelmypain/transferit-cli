@@ -40,7 +40,7 @@ const (
 
 var (
 	httpClient = &http.Client{Timeout: 0}
-	linkRE     = regexp.MustCompile(`(?i)(?:https?://)?(?:www\.)?transfer\.it/t/([A-Za-z0-9_-]+)`)
+	linkRE     = regexp.MustCompile("(?i)(?:^|[\\s<(\"'`])(?:https?://)?(?:www\\.)?transfer\\.it/t/([A-Za-z0-9_-]+)")
 )
 
 type apiClient struct {
@@ -255,11 +255,15 @@ func runDownload(args []string) error {
 		return err
 	}
 
+	seenPaths := map[string]string{}
 	for _, folder := range folders {
 		if folder.P == "" || folder.Path == "" {
 			continue
 		}
 		dst := filepath.Join(baseDir, filepath.FromSlash(folder.Path))
+		if err := reserveDownloadPath(seenPaths, dst, "folder "+folder.Path); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(dst, 0755); err != nil {
 			return err
 		}
@@ -271,6 +275,9 @@ func runDownload(args []string) error {
 			rel = file.Name
 		}
 		dst := filepath.Join(baseDir, filepath.FromSlash(rel))
+		if err := reserveDownloadPath(seenPaths, dst, "file "+rel); err != nil {
+			return err
+		}
 		if err := downloadNode(xh, pwToken, file, dst); err != nil {
 			return err
 		}
@@ -764,19 +771,30 @@ func collectUploadItems(paths []string) ([]uploadItem, error) {
 }
 
 func parseTransferHandle(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		host := strings.ToLower(u.Hostname())
+		if host != "transfer.it" && host != "www.transfer.it" {
+			return "", fmt.Errorf("unsupported transfer host %q", u.Host)
+		}
+		if handle := transferHandleFromPath(u.Path); handle != "" {
+			return handle, nil
+		}
+	}
 	if m := linkRE.FindStringSubmatch(raw); len(m) == 2 {
 		return m[1], nil
 	}
-	u, err := url.Parse(raw)
-	if err == nil {
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		for i := 0; i+1 < len(parts); i++ {
-			if parts[i] == "t" && parts[i+1] != "" {
-				return parts[i+1], nil
-			}
+	return "", fmt.Errorf("could not parse transfer handle from %q", raw)
+}
+
+func transferHandleFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "t" && parts[i+1] != "" {
+			return parts[i+1]
 		}
 	}
-	return "", fmt.Errorf("could not parse transfer handle from %q", raw)
+	return ""
 }
 
 func getTransferInfo(xh string) (transferInfo, error) {
@@ -856,6 +874,15 @@ func buildNodePath(n *transferNode, byHandle map[string]*transferNode) string {
 	return strings.Join(parts, "/")
 }
 
+func reserveDownloadPath(seen map[string]string, dst, label string) error {
+	clean := filepath.Clean(dst)
+	if prev, ok := seen[clean]; ok {
+		return fmt.Errorf("download path collision: %s and %s both map to %s", prev, label, clean)
+	}
+	seen[clean] = label
+	return nil
+}
+
 func downloadNode(xh, pwToken string, n transferNode, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
@@ -865,13 +892,38 @@ func downloadNode(xh, pwToken string, n transferNode, dst string) error {
 		existing = st.Size()
 	}
 	if existing == n.S && n.S > 0 {
-		fmt.Printf("Already complete: %s (%d bytes)\n", dst, n.S)
-		return nil
+		if err := verifyDownloadedFile(dst, n); err == nil {
+			fmt.Printf("Already complete: %s (%d bytes, verified)\n", dst, n.S)
+			return nil
+		} else {
+			fmt.Printf("Existing file failed integrity check, redownloading: %v\n", err)
+			existing = 0
+		}
 	}
 	if existing > n.S {
 		existing = 0
 	}
 
+	if err := downloadNodeBytes(xh, pwToken, n, dst, existing); err != nil {
+		return err
+	}
+	if err := verifyDownloadedFile(dst, n); err != nil {
+		if existing > 0 {
+			fmt.Printf("Integrity check failed after resume, retrying from start: %v\n", err)
+			if err := downloadNodeBytes(xh, pwToken, n, dst, 0); err != nil {
+				return err
+			}
+			if retryErr := verifyDownloadedFile(dst, n); retryErr != nil {
+				return fmt.Errorf("downloaded file failed integrity check after retry: %w", retryErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("downloaded file failed integrity check: %w", err)
+	}
+	return nil
+}
+
+func downloadNodeBytes(xh, pwToken string, n transferNode, dst string, existing int64) error {
 	downloadURL := fmt.Sprintf("%s/cs/g?x=%s&n=%s&fn=%s", transferAPI, url.QueryEscape(xh), url.QueryEscape(n.H), url.QueryEscape(n.Name))
 	if pwToken != "" {
 		downloadURL += "&pw=" + url.QueryEscape(pwToken)
@@ -914,6 +966,82 @@ func downloadNode(xh, pwToken string, n transferNode, dst string) error {
 
 	fmt.Printf("Downloading %s -> %s\n", n.Name, dst)
 	return copyWithProgress(f, resp.Body, existing, n.S)
+}
+
+func verifyDownloadedFile(path string, n transferNode) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.Size() != n.S {
+		return fmt.Errorf("size mismatch: got %d bytes, want %d bytes", st.Size(), n.S)
+	}
+	fileKey, err := decodeFileKey(n.K)
+	if err != nil {
+		return err
+	}
+	computed, err := computeFileKeyFromPlaintext(path, fileKey, n.S)
+	if err != nil {
+		return err
+	}
+	if !wordsEqual(computed, fileKey) {
+		return errors.New("MAC mismatch")
+	}
+	return nil
+}
+
+func decodeFileKey(key64 string) ([]uint32, error) {
+	keyBytes, err := b64Decode(key64)
+	if err != nil {
+		return nil, err
+	}
+	if len(keyBytes)%4 != 0 {
+		return nil, fmt.Errorf("file key is not word-aligned: %d bytes", len(keyBytes))
+	}
+	keyWords := bytesToWords(keyBytes)
+	if len(keyWords) < 8 {
+		return nil, fmt.Errorf("file key is too short: %d words", len(keyWords))
+	}
+	return keyWords[:8], nil
+}
+
+func computeFileKeyFromPlaintext(path string, fileKey []uint32, size int64) ([]uint32, error) {
+	if len(fileKey) < 8 {
+		return nil, fmt.Errorf("file key is too short: %d words", len(fileKey))
+	}
+	ukey := []uint32{
+		fileKey[0] ^ fileKey[4],
+		fileKey[1] ^ fileKey[5],
+		fileKey[2] ^ fileKey[6],
+		fileKey[3] ^ fileKey[7],
+		fileKey[4],
+		fileKey[5],
+	}
+	chunks := getChunkSizes(size)
+	if len(chunks) == 0 {
+		chunks = []chunkSize{{position: 0, size: 0}}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	macs := make([][]byte, 0, len(chunks))
+	for _, ch := range chunks {
+		buf := make([]byte, ch.size)
+		if ch.size > 0 {
+			if _, err := f.ReadAt(buf, ch.position); err != nil {
+				return nil, err
+			}
+		}
+		_, mac, err := encryptUploadChunk(buf, ukey, ch.position)
+		if err != nil {
+			return nil, err
+		}
+		macs = append(macs, mac)
+	}
+	return buildFileKey(ukey, macs)
 }
 
 func createAnonymousSession() (session, error) {
@@ -1627,6 +1755,13 @@ func (c *apiClient) call(payload any, query url.Values, out any) error {
 			}
 			return apiError{Code: code, Body: strings.TrimSpace(string(resBody))}
 		}
+		if code, ok := firstNegativeArrayCode(resBody); ok {
+			if isTransientAPICode(code) && attempt < 5 {
+				time.Sleep(apiRetryDelay(attempt))
+				continue
+			}
+			return apiError{Code: code, Body: strings.TrimSpace(string(resBody))}
+		}
 		if out == nil {
 			return nil
 		}
@@ -2130,6 +2265,14 @@ func negativeAPICode(body []byte) (int, bool) {
 	return code, err == nil
 }
 
+func firstNegativeArrayCode(body []byte) (int, bool) {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil || len(raw) == 0 {
+		return 0, false
+	}
+	return negativeAPICode(raw[0])
+}
+
 func isInvalidSessionError(err error) bool {
 	var apiErr apiError
 	return errors.As(err, &apiErr) && apiErr.Code == -15
@@ -2200,6 +2343,18 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func wordsEqual(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func splitEmails(s string) []string {
