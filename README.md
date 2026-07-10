@@ -8,7 +8,7 @@ The repository contains:
 - `script.go`: the complete Go source code.
 - `script_test.go`: regression tests for parsing, crypto helpers, chunk sizing,
   and API error parsing.
-- `go.mod`: module metadata. The tool uses only the Go standard library.
+- `go.mod`: module metadata and the Unicode normalization dependency.
 - `README.md`: user guide.
 - `API.md`: developer notes for the reverse-engineered transfer.it/MEGA API.
 
@@ -76,7 +76,7 @@ Upload and add recipients using the transfer.it "Send files" behavior:
 Build the CLI:
 
 ```bash
-go build -o transferit script.go
+CGO_ENABLED=0 go build -trimpath -buildvcs=true -o transferit .
 ```
 
 To run from source without building:
@@ -85,7 +85,8 @@ To run from source without building:
 go run script.go --help
 ```
 
-The code is written for Go 1.22 and uses only the standard library.
+The code requires Go 1.26.5 or newer. Its only external dependency is
+`golang.org/x/text`, used for portable Unicode filename collision checks.
 
 ## Commands
 
@@ -140,8 +141,9 @@ Examples:
 - Downloaded files are verified against the MEGA-style file MAC stored in the
   node key.
 - Existing complete files are skipped only after integrity verification.
-- Existing partial files are resumed with an HTTP `Range` request. If integrity
-  verification fails after resume, the file is downloaded again from byte 0.
+- Partial downloads are staged in `.part` files and resumed with an HTTP `Range`
+  request. If integrity verification fails after resume, the file is downloaded
+  again from byte 0. A verified staged file atomically replaces the destination.
 - Multi-file or directory transfers are placed inside a subdirectory named after
   the transfer title.
 - Empty folders are recreated when downloading directory transfers.
@@ -280,7 +282,8 @@ The config file is stored at:
 The file is written with mode `0600`. If `--save-password` or
 `--save-account-password` is used, the MEGA password is stored in that file in
 plaintext. This is convenient for automation, but it means anyone who can read
-that config file can use the account.
+that config file can use the account. On Windows, access is controlled by the
+ACL inherited from `%AppData%`; ensure that directory is private to your user.
 
 MEGA may return a login proof-of-work challenge through the `X-Hashcash`
 header. The CLI solves that challenge automatically before retrying the login.
@@ -428,7 +431,7 @@ Upload flow:
 - Upload resume is not implemented.
 - Symlinks and special files are not followed or uploaded.
 - Prebuilt binaries are not committed by default. Build locally with
-  `go build -o transferit script.go`, or publish binaries separately through
+  `CGO_ENABLED=0 go build -trimpath -buildvcs=true -o transferit .`, or publish binaries separately through
   GitHub Releases.
 - transfer.it is not a public stable API. If their webclient protocol changes,
   this tool may need updates.

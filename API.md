@@ -783,10 +783,11 @@ Stored fields:
 | `email` | Saved MEGA account email |
 | `password` | Optional plaintext password, only saved when requested |
 | `sid` | Reusable MEGA session id |
-| `master_key` | Base64url-encoded decrypted master key |
 | `updated_at` | Timestamp when the config was last saved |
 
-The config file is written with mode `0600`.
+The config file is written with mode `0600`. The decrypted account master key
+is used only in memory during login and is not persisted. On Windows, the file
+inherits its access-control list from `%AppData%`.
 
 For `upload --account`, the CLI prefers the saved `sid` first. An explicit
 `--account-password` forces a fresh login. If no saved session is available but

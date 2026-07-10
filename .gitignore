@@ -1,6 +1,8 @@
 # Build outputs
 /transferit
 /transferit.exe
+/transferit-cli
+/transferit-cli.exe
 *.test
 *.out
 
@@ -21,4 +23,3 @@ config.json
 Thumbs.db
 .idea/
 .vscode/
-

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -19,6 +20,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,16 +32,26 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
-	megaAPI     = "https://g.api.mega.co.nz"
-	transferAPI = "https://bt7.api.mega.co.nz"
-	origin      = "https://transfer.it"
+	megaAPI                = "https://g.api.mega.co.nz"
+	transferAPI            = "https://bt7.api.mega.co.nz"
+	origin                 = "https://transfer.it"
+	maxAPIResponseSize     = 8 << 20
+	maxUploadResponseSize  = 1 << 20
+	responseHeaderTimeout  = 30 * time.Second
+	connectionSetupTimeout = 10 * time.Second
+	apiRequestTimeout      = 2 * time.Minute
+	uploadChunkTimeout     = 2 * time.Minute
+	downloadIdleTimeout    = 2 * time.Minute
 )
 
 var (
-	httpClient = &http.Client{Timeout: 0}
+	httpClient = newHTTPClient()
 	linkRE     = regexp.MustCompile("(?i)(?:^|[\\s<(\"'`])(?:https?://)?(?:www\\.)?transfer\\.it/t/([A-Za-z0-9_-]+)")
 )
 
@@ -75,7 +87,6 @@ type savedAccount struct {
 	Email     string `json:"email,omitempty"`
 	Password  string `json:"password,omitempty"`
 	SID       string `json:"sid,omitempty"`
-	MasterKey string `json:"master_key,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
@@ -243,42 +254,113 @@ func runDownload(args []string) error {
 		return errors.New("transfer contains no downloadable files or folders")
 	}
 
-	baseDir := *outDir
+	outputRoot, err := filepath.Abs(*outDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(outputRoot, 0755); err != nil {
+		return err
+	}
+	outputRoot, err = filepath.EvalSymlinks(outputRoot)
+	if err != nil {
+		return err
+	}
+	baseDir := outputRoot
 	if len(files) > 1 || hasChildFolder {
 		title := decodeMaybeBase64(info.Title)
 		if title == "" {
 			title = xh
 		}
-		baseDir = filepath.Join(baseDir, safeName(title))
-	}
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return err
+		baseDir, err = resolveDownloadPath(outputRoot, safeName(title))
+		if err != nil {
+			return err
+		}
 	}
 
 	seenPaths := map[string]string{}
+	folderPaths := make([]string, 0, len(folders))
 	for _, folder := range folders {
 		if folder.P == "" || folder.Path == "" {
 			continue
 		}
-		dst := filepath.Join(baseDir, filepath.FromSlash(folder.Path))
+		dst, err := resolveDownloadPath(baseDir, folder.Path)
+		if err != nil {
+			return fmt.Errorf("invalid folder path %q: %w", folder.Path, err)
+		}
 		if err := reserveDownloadPath(seenPaths, dst, "folder "+folder.Path); err != nil {
 			return err
 		}
-		if err := os.MkdirAll(dst, 0755); err != nil {
-			return err
-		}
+		folderPaths = append(folderPaths, dst)
 	}
 
+	type fileDownload struct {
+		node transferNode
+		dst  string
+	}
+	downloads := make([]fileDownload, 0, len(files))
 	for _, file := range files {
 		rel := file.Path
 		if rel == "" {
 			rel = file.Name
 		}
-		dst := filepath.Join(baseDir, filepath.FromSlash(rel))
+		dst, err := resolveDownloadPath(baseDir, rel)
+		if err != nil {
+			return fmt.Errorf("invalid file path %q: %w", rel, err)
+		}
 		if err := reserveDownloadPath(seenPaths, dst, "file "+rel); err != nil {
 			return err
 		}
-		if err := downloadNode(xh, pwToken, file, dst); err != nil {
+		if err := reserveDownloadPath(seenPaths, dst+".part", "partial file "+rel); err != nil {
+			return err
+		}
+		downloads = append(downloads, fileDownload{node: file, dst: dst})
+	}
+
+	if err := rejectSymlinkComponents(outputRoot, baseDir); err != nil {
+		return err
+	}
+	for _, dst := range folderPaths {
+		if err := rejectSymlinkComponents(outputRoot, dst); err != nil {
+			return err
+		}
+	}
+	for _, download := range downloads {
+		if err := rejectSymlinkComponents(outputRoot, download.dst); err != nil {
+			return err
+		}
+	}
+	outputHandle, err := os.OpenRoot(outputRoot)
+	if err != nil {
+		return err
+	}
+	defer outputHandle.Close()
+	baseRel, err := filepath.Rel(outputRoot, baseDir)
+	if err != nil {
+		return err
+	}
+	if err := outputHandle.MkdirAll(baseRel, 0755); err != nil {
+		return err
+	}
+	downloadRoot, err := outputHandle.OpenRoot(baseRel)
+	if err != nil {
+		return err
+	}
+	defer downloadRoot.Close()
+	for _, dst := range folderPaths {
+		rel, err := filepath.Rel(baseDir, dst)
+		if err != nil {
+			return err
+		}
+		if err := downloadRoot.MkdirAll(rel, 0755); err != nil {
+			return err
+		}
+	}
+	for _, download := range downloads {
+		rel, err := filepath.Rel(baseDir, download.dst)
+		if err != nil {
+			return err
+		}
+		if err := downloadNode(downloadRoot, xh, pwToken, download.node, rel, download.dst); err != nil {
 			return err
 		}
 	}
@@ -391,7 +473,7 @@ func runAccountLogin(args []string) error {
 	}
 	fmt.Printf("Saved account session to %s.\n", mustConfigPath())
 	if *savePassword {
-		fmt.Println("Saved account password too. The config file is written with mode 0600.")
+		fmt.Println("Saved account password too. Protect the config file as an account credential.")
 	}
 	return nil
 }
@@ -416,7 +498,6 @@ func runAccountStatus(args []string) error {
 	}
 	fmt.Printf("Email: %s\n", cfg.Account.Email)
 	fmt.Printf("Saved session: %t\n", cfg.Account.SID != "")
-	fmt.Printf("Saved master key: %t\n", cfg.Account.MasterKey != "")
 	fmt.Printf("Saved password: %t\n", cfg.Account.Password != "")
 	if cfg.Account.UpdatedAt != "" {
 		fmt.Printf("Updated: %s\n", cfg.Account.UpdatedAt)
@@ -466,7 +547,7 @@ func resolveUploadSession(useAccount bool, accountEmail, accountPassword, mfa st
 		if cfg.Account.Email != "" {
 			label += " for " + cfg.Account.Email
 		}
-		return session{sid: cfg.Account.SID, masterKey: decodeSavedWords(cfg.Account.MasterKey)}, label, nil
+		return session{sid: cfg.Account.SID}, label, nil
 	}
 
 	password := accountPassword
@@ -608,6 +689,17 @@ func runUpload(args []string) error {
 	if *uploadWorkers < 1 || *uploadWorkers > 16 {
 		return errors.New("--upload-workers must be between 1 and 16")
 	}
+	recipients := splitEmails(*to)
+	schedule, err := parseSchedule(*sendAt)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*sendAt) != "" && len(recipients) == 0 {
+		return errors.New("--send-at requires at least one --to recipient")
+	}
+	if strings.TrimSpace(*sendAt) != "" && schedule <= time.Now().Unix() {
+		return errors.New("--send-at must be in the future")
+	}
 
 	paths := fs.Args()
 	items, err := collectUploadItems(paths)
@@ -618,7 +710,11 @@ func runUpload(args []string) error {
 	name := strings.TrimSpace(*title)
 	if name == "" {
 		if len(paths) == 1 {
-			name = filepath.Base(paths[0])
+			absolute, err := filepath.Abs(paths[0])
+			if err != nil {
+				return err
+			}
+			name = filepath.Base(absolute)
 		} else {
 			name = "Transfer.it " + time.Now().UTC().Format("2006-01-02 15:04:05")
 		}
@@ -682,11 +778,9 @@ func runUpload(args []string) error {
 		return err
 	}
 
-	recipients := splitEmails(*to)
 	if len(recipients) > 0 {
-		schedule, err := parseSchedule(*sendAt)
-		if err != nil {
-			return err
+		if schedule != 0 && schedule <= time.Now().Unix() {
+			return errors.New("--send-at elapsed before the upload completed")
 		}
 		for _, email := range recipients {
 			if err := setTransferRecipient(tapi, xh, email, schedule); err != nil {
@@ -715,9 +809,12 @@ func collectUploadItems(paths []string) ([]uploadItem, error) {
 	seen := map[string]bool{}
 	for _, input := range paths {
 		clean := filepath.Clean(input)
-		st, err := os.Stat(clean)
+		st, err := os.Lstat(clean)
 		if err != nil {
 			return nil, err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("symlink is not supported: %s", input)
 		}
 		if !st.IsDir() {
 			if !st.Mode().IsRegular() {
@@ -732,7 +829,14 @@ func collectUploadItems(paths []string) ([]uploadItem, error) {
 			continue
 		}
 
-		rootName := filepath.Base(clean)
+		absolute, err := filepath.Abs(clean)
+		if err != nil {
+			return nil, err
+		}
+		rootName := filepath.Base(absolute)
+		if rootName == "." || rootName == string(filepath.Separator) || rootName == "" {
+			return nil, fmt.Errorf("cannot upload filesystem root %q", input)
+		}
 		err = filepath.WalkDir(clean, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -813,6 +917,10 @@ func validateTransferPassword(xh, token string) error {
 	var out []json.RawMessage
 	err := (&apiClient{base: transferAPI}).call([]map[string]any{{"a": "xv", "xh": xh, "pw": token}}, nil, &out)
 	if err != nil {
+		var apiErr apiError
+		if errors.As(err, &apiErr) && apiErr.Code == -14 {
+			return errors.New("invalid transfer password")
+		}
 		return err
 	}
 	if len(out) != 1 || string(out[0]) != "1" {
@@ -846,8 +954,20 @@ func fetchNodes(xh, pwToken string) ([]transferNode, error) {
 	nodes := out[0].F
 	byHandle := map[string]*transferNode{}
 	for i := range nodes {
+		if nodes[i].H == "" {
+			return nil, fmt.Errorf("node %d has an empty handle", i)
+		}
+		if _, exists := byHandle[nodes[i].H]; exists {
+			return nil, fmt.Errorf("duplicate node handle %q", nodes[i].H)
+		}
+		if nodes[i].T == 0 && nodes[i].S < 0 {
+			return nil, fmt.Errorf("file node %q has negative size %d", nodes[i].H, nodes[i].S)
+		}
 		name, err := decryptNodeName(nodes[i].A, nodes[i].K)
-		if err == nil && name != "" {
+		if err != nil && (nodes[i].T == 0 || nodes[i].T == 1) {
+			return nil, fmt.Errorf("decrypt node %q attributes: %w", nodes[i].H, err)
+		}
+		if name != "" {
 			nodes[i].Name = name
 		}
 		if nodes[i].Name == "" {
@@ -856,74 +976,159 @@ func fetchNodes(xh, pwToken string) ([]transferNode, error) {
 		byHandle[nodes[i].H] = &nodes[i]
 	}
 	for i := range nodes {
-		nodes[i].Path = buildNodePath(&nodes[i], byHandle)
+		nodes[i].Path, err = buildNodePath(&nodes[i], byHandle)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return nodes, nil
 }
 
-func buildNodePath(n *transferNode, byHandle map[string]*transferNode) string {
+func buildNodePath(n *transferNode, byHandle map[string]*transferNode) (string, error) {
 	parts := []string{safeName(n.Name)}
+	visited := map[string]bool{n.H: true}
 	for p := n.P; p != ""; {
+		if visited[p] {
+			return "", fmt.Errorf("node parent cycle involving %q", p)
+		}
+		visited[p] = true
 		parent := byHandle[p]
-		if parent == nil || parent.P == "" {
+		if parent == nil {
+			return "", fmt.Errorf("node %q references missing parent %q", n.H, p)
+		}
+		if parent.P == "" {
 			break
 		}
 		parts = append([]string{safeName(parent.Name)}, parts...)
 		p = parent.P
 	}
-	return strings.Join(parts, "/")
+	return strings.Join(parts, "/"), nil
 }
 
-func reserveDownloadPath(seen map[string]string, dst, label string) error {
-	clean := filepath.Clean(dst)
-	if prev, ok := seen[clean]; ok {
-		return fmt.Errorf("download path collision: %s and %s both map to %s", prev, label, clean)
+func resolveDownloadPath(baseDir, rel string) (string, error) {
+	root, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
 	}
-	seen[clean] = label
+	native := filepath.FromSlash(rel)
+	if strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "\\") || filepath.IsAbs(native) || filepath.VolumeName(native) != "" {
+		return "", errors.New("absolute paths are not allowed")
+	}
+	dst := filepath.Join(root, native)
+	within, err := filepath.Rel(root, dst)
+	if err != nil {
+		return "", err
+	}
+	if within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes the output directory")
+	}
+	return dst, nil
+}
+
+func rejectSymlinkComponents(baseDir, dst string) error {
+	rel, err := filepath.Rel(baseDir, dst)
+	if err != nil {
+		return err
+	}
+	current := baseDir
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		st, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("download path contains symlink: %s", current)
+		}
+	}
 	return nil
 }
 
-func downloadNode(xh, pwToken string, n transferNode, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+func reserveDownloadPath(seen map[string]string, dst, label string) error {
+	key := portableDownloadPathKey(dst)
+	if prev, ok := seen[key]; ok {
+		return fmt.Errorf("download path collision: %s and %s both map to %s", prev, label, filepath.Clean(dst))
+	}
+	seen[key] = label
+	return nil
+}
+
+func portableDownloadPathKey(path string) string {
+	volume := strings.ToLower(filepath.VolumeName(path))
+	path = strings.TrimPrefix(filepath.Clean(path), filepath.VolumeName(path))
+	parts := strings.FieldsFunc(filepath.ToSlash(path), func(r rune) bool { return r == '/' })
+	for i := range parts {
+		parts[i] = cases.Fold().String(norm.NFC.String(strings.TrimRight(parts[i], " .")))
+	}
+	return volume + "/" + strings.Join(parts, "/")
+}
+
+func downloadNode(root *os.Root, xh, pwToken string, n transferNode, rel, displayPath string) error {
+	if err := root.MkdirAll(filepath.Dir(rel), 0755); err != nil {
 		return err
 	}
-	existing := int64(0)
-	if st, err := os.Stat(dst); err == nil {
-		existing = st.Size()
-	}
-	if existing == n.S && n.S > 0 {
-		if err := verifyDownloadedFile(dst, n); err == nil {
-			fmt.Printf("Already complete: %s (%d bytes, verified)\n", dst, n.S)
-			return nil
-		} else {
-			fmt.Printf("Existing file failed integrity check, redownloading: %v\n", err)
-			existing = 0
+	if st, err := root.Lstat(rel); err == nil {
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("download destination is not a regular file: %s", displayPath)
 		}
+		if st.Size() == n.S {
+			if err := verifyDownloadedFileInRoot(root, rel, n); err == nil {
+				fmt.Printf("Already complete: %s (%d bytes, verified)\n", displayPath, n.S)
+				return nil
+			} else {
+				fmt.Printf("Existing file failed integrity check, redownloading: %v\n", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	partRel := rel + ".part"
+	existing := int64(0)
+	if st, err := root.Lstat(partRel); err == nil {
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("partial download is not a regular file: %s.part", displayPath)
+		}
+		existing = st.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if existing == n.S {
+		if err := verifyDownloadedFileInRoot(root, partRel, n); err == nil {
+			return root.Rename(partRel, rel)
+		}
+		existing = 0
 	}
 	if existing > n.S {
 		existing = 0
 	}
 
-	if err := downloadNodeBytes(xh, pwToken, n, dst, existing); err != nil {
+	if err := downloadNodeBytes(root, xh, pwToken, n, partRel, displayPath+".part", existing); err != nil {
 		return err
 	}
-	if err := verifyDownloadedFile(dst, n); err != nil {
+	if err := verifyDownloadedFileInRoot(root, partRel, n); err != nil {
 		if existing > 0 {
 			fmt.Printf("Integrity check failed after resume, retrying from start: %v\n", err)
-			if err := downloadNodeBytes(xh, pwToken, n, dst, 0); err != nil {
+			if err := downloadNodeBytes(root, xh, pwToken, n, partRel, displayPath+".part", 0); err != nil {
 				return err
 			}
-			if retryErr := verifyDownloadedFile(dst, n); retryErr != nil {
+			if retryErr := verifyDownloadedFileInRoot(root, partRel, n); retryErr != nil {
 				return fmt.Errorf("downloaded file failed integrity check after retry: %w", retryErr)
 			}
-			return nil
+		} else {
+			return fmt.Errorf("downloaded file failed integrity check: %w", err)
 		}
-		return fmt.Errorf("downloaded file failed integrity check: %w", err)
 	}
-	return nil
+	return root.Rename(partRel, rel)
 }
 
-func downloadNodeBytes(xh, pwToken string, n transferNode, dst string, existing int64) error {
+func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, displayPath string, existing int64) error {
 	downloadURL := fmt.Sprintf("%s/cs/g?x=%s&n=%s&fn=%s", transferAPI, url.QueryEscape(xh), url.QueryEscape(n.H), url.QueryEscape(n.Name))
 	if pwToken != "" {
 		downloadURL += "&pw=" + url.QueryEscape(pwToken)
@@ -941,15 +1146,23 @@ func downloadNodeBytes(xh, pwToken string, n transferNode, dst string, existing 
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return sanitizeHTTPError(err, req.URL)
 	}
 	defer resp.Body.Close()
 	if existing > 0 && resp.StatusCode == http.StatusOK {
 		existing = 0
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(idleTimeoutReader{reader: resp.Body, timeout: downloadIdleTimeout}, 4096))
 		return fmt.Errorf("download HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		if existing == 0 {
+			return errors.New("download server returned an unexpected partial response")
+		}
+		if err := validateContentRange(resp.Header.Get("Content-Range"), existing, n.S); err != nil {
+			return err
+		}
 	}
 
 	flags := os.O_CREATE | os.O_WRONLY
@@ -958,20 +1171,105 @@ func downloadNodeBytes(xh, pwToken string, n transferNode, dst string, existing 
 	} else {
 		flags |= os.O_TRUNC
 	}
-	f, err := os.OpenFile(dst, flags, 0644)
+	f, err := root.OpenFile(rel, flags, 0644)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Downloading %s -> %s\n", n.Name, displayPath)
+	remaining := n.S - existing
+	limited := &io.LimitedReader{R: idleTimeoutReader{reader: resp.Body, timeout: downloadIdleTimeout}, N: remaining + 1}
+	copyErr := copyWithProgress(f, limited, existing, n.S)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("download exceeded expected size of %d bytes", n.S)
+	}
+	st, err := root.Stat(rel)
+	if err != nil {
+		return err
+	}
+	if st.Size() != n.S {
+		return fmt.Errorf("download ended at %d bytes, want %d", st.Size(), n.S)
+	}
+	return nil
+}
+
+func validateContentRange(header string, start, total int64) error {
+	if !strings.HasPrefix(header, "bytes ") {
+		return fmt.Errorf("invalid Content-Range %q", header)
+	}
+	byteRange, totalText, ok := strings.Cut(strings.TrimPrefix(header, "bytes "), "/")
+	if !ok {
+		return fmt.Errorf("invalid Content-Range %q", header)
+	}
+	startText, endText, ok := strings.Cut(byteRange, "-")
+	if !ok {
+		return fmt.Errorf("invalid Content-Range %q", header)
+	}
+	gotStart, startErr := strconv.ParseInt(startText, 10, 64)
+	gotEnd, endErr := strconv.ParseInt(endText, 10, 64)
+	gotTotal, totalErr := strconv.ParseInt(totalText, 10, 64)
+	if startErr != nil || endErr != nil || totalErr != nil || gotStart != start || gotEnd != total-1 || gotTotal != total {
+		return fmt.Errorf("unexpected Content-Range %q, want bytes %d-%d/%d", header, start, total-1, total)
+	}
+	return nil
+}
+
+type idleTimeoutReader struct {
+	reader  io.Reader
+	timeout time.Duration
+}
+
+func (r idleTimeoutReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		n, err := r.reader.Read(p)
+		resultCh <- result{n: n, err: err}
+	}()
+	timer := time.NewTimer(r.timeout)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		return result.n, result.err
+	case <-timer.C:
+		return 0, fmt.Errorf("download stalled for %s", r.timeout)
+	}
+}
+
+func verifyDownloadedFile(path string, n transferNode) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	fmt.Printf("Downloading %s -> %s\n", n.Name, dst)
-	return copyWithProgress(f, resp.Body, existing, n.S)
+	return verifyDownloadedReader(f, n)
 }
 
-func verifyDownloadedFile(path string, n transferNode) error {
-	st, err := os.Stat(path)
+func verifyDownloadedFileInRoot(root *os.Root, path string, n transferNode) error {
+	f, err := root.Open(path)
 	if err != nil {
 		return err
+	}
+	defer f.Close()
+	return verifyDownloadedReader(f, n)
+}
+
+func verifyDownloadedReader(f *os.File, n transferNode) error {
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return errors.New("download is not a regular file")
 	}
 	if st.Size() != n.S {
 		return fmt.Errorf("size mismatch: got %d bytes, want %d bytes", st.Size(), n.S)
@@ -980,7 +1278,7 @@ func verifyDownloadedFile(path string, n transferNode) error {
 	if err != nil {
 		return err
 	}
-	computed, err := computeFileKeyFromPlaintext(path, fileKey, n.S)
+	computed, err := computeFileKeyFromReader(f, fileKey, n.S)
 	if err != nil {
 		return err
 	}
@@ -1006,6 +1304,15 @@ func decodeFileKey(key64 string) ([]uint32, error) {
 }
 
 func computeFileKeyFromPlaintext(path string, fileKey []uint32, size int64) ([]uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return computeFileKeyFromReader(f, fileKey, size)
+}
+
+func computeFileKeyFromReader(f io.ReaderAt, fileKey []uint32, size int64) ([]uint32, error) {
 	if len(fileKey) < 8 {
 		return nil, fmt.Errorf("file key is too short: %d words", len(fileKey))
 	}
@@ -1021,12 +1328,6 @@ func computeFileKeyFromPlaintext(path string, fileKey []uint32, size int64) ([]u
 	if len(chunks) == 0 {
 		chunks = []chunkSize{{position: 0, size: 0}}
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
 	macs := make([][]byte, 0, len(chunks))
 	for _, ch := range chunks {
 		buf := make([]byte, ch.size)
@@ -1174,6 +1475,10 @@ func completeMegaLogin(email, userHash string, passwordKey []uint32, mfa string)
 	var raw []json.RawMessage
 	err := (&apiClient{base: megaAPI}).call([]map[string]any{req}, nil, &raw)
 	if err != nil {
+		var apiErr apiError
+		if errors.As(err, &apiErr) && apiErr.Code == -26 {
+			return session{}, errors.New("MEGA account requires two-factor authentication; pass --mfa CODE")
+		}
 		return session{}, err
 	}
 	if len(raw) != 1 {
@@ -1260,19 +1565,23 @@ func prepareMegaKey(words []uint32) ([]uint32, error) {
 	if len(words) == 0 {
 		words = []uint32{0, 0, 0, 0}
 	}
-	key := []uint32{0x93C467E3, 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56}
+	blocks := make([]cipher.Block, 0, (len(words)+3)/4)
+	for i := 0; i < len(words); i += 4 {
+		var blockKey [4]uint32
+		copy(blockKey[:], words[i:minInt(i+4, len(words))])
+		block, err := aes.NewCipher(wordsToBytes(blockKey[:]))
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, block)
+	}
+	key := wordsToBytes([]uint32{0x93C467E3, 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56})
 	for round := 0; round < 0x10000; round++ {
-		for i := 0; i < len(words); i += 4 {
-			blockKey := make([]uint32, 4)
-			copy(blockKey, words[i:minInt(i+4, len(words))])
-			var err error
-			key, err = encryptWords(blockKey, key)
-			if err != nil {
-				return nil, err
-			}
+		for _, block := range blocks {
+			block.Encrypt(key, key)
 		}
 	}
-	return key, nil
+	return bytesToWords(key), nil
 }
 
 func megaStringHash(email string, passwordKey []uint32) (string, error) {
@@ -1281,13 +1590,15 @@ func megaStringHash(email string, passwordKey []uint32) (string, error) {
 	for i, word := range words {
 		hashWords[i%4] ^= word
 	}
-	var err error
-	for i := 0; i < 0x4000; i++ {
-		hashWords, err = encryptWords(passwordKey, hashWords)
-		if err != nil {
-			return "", err
-		}
+	block, err := aes.NewCipher(wordsToBytes(passwordKey))
+	if err != nil {
+		return "", err
 	}
+	hashBytes := wordsToBytes(hashWords)
+	for i := 0; i < 0x4000; i++ {
+		block.Encrypt(hashBytes, hashBytes)
+	}
+	hashWords = bytesToWords(hashBytes)
 	return b64Encode(wordsToBytes([]uint32{hashWords[0], hashWords[2]})), nil
 }
 
@@ -1429,9 +1740,17 @@ func createRemoteFolder(api *apiClient, parent, name string) (string, error) {
 }
 
 func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, uploadWorkers int) (uploadResult, error) {
-	st, err := os.Stat(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		return uploadResult{}, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return uploadResult{}, err
+	}
+	if !st.Mode().IsRegular() {
+		return uploadResult{}, fmt.Errorf("not a regular file: %s", filePath)
 	}
 	size := st.Size()
 
@@ -1445,12 +1764,6 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, 
 		return uploadResult{}, errors.New("unexpected upload URL response")
 	}
 
-	f, err := os.Open(filePath)
-	if err != nil {
-		return uploadResult{}, err
-	}
-	defer f.Close()
-
 	ukey, err := randomWords(6)
 	if err != nil {
 		return uploadResult{}, err
@@ -1463,6 +1776,13 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, 
 	completion, macs, err := uploadChunks(f, upRes[0].P, ukey, chunks, size, uploadWorkers, postUploadChunk)
 	if err != nil {
 		return uploadResult{}, err
+	}
+	afterUpload, err := f.Stat()
+	if err != nil {
+		return uploadResult{}, err
+	}
+	if afterUpload.Size() != st.Size() || !afterUpload.ModTime().Equal(st.ModTime()) {
+		return uploadResult{}, fmt.Errorf("source file changed during upload: %s", filePath)
 	}
 	fmt.Println()
 	if completion == "" {
@@ -1497,7 +1817,7 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, 
 	return uploadResult{Handle: xpRes[0].F[0].H, Name: remoteName, Path: displayPath, Size: size}, nil
 }
 
-type uploadChunkPoster func(uploadURL string, offset int64, data []byte) ([]byte, error)
+type uploadChunkPoster func(ctx context.Context, uploadURL string, offset int64, data []byte) ([]byte, error)
 
 type uploadChunkResult struct {
 	index int
@@ -1516,6 +1836,8 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 	}
 	macs := make([][]byte, len(chunks))
 	completion := ""
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	start := time.Now()
 	var uploaded int64
 	nextPrint := time.Now()
@@ -1530,12 +1852,12 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 	last := len(chunks) - 1
 	if workers == 1 || last == 0 {
 		for index := 0; index <= last; index++ {
-			res := uploadOneChunk(r, uploadURL, ukey, chunks, index, poster)
+			res := uploadOneChunk(ctx, r, uploadURL, ukey, chunks, index, poster)
 			if res.err != nil {
 				return "", nil, fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
 			}
 			macs[res.index] = res.mac
-			if len(res.body) > 0 {
+			if index == last && len(res.body) > 0 {
 				completion = string(res.body)
 			}
 			reportProgress(res.size)
@@ -1551,16 +1873,43 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 	for i := 0; i < workerCount; i++ {
 		go func() {
 			defer wg.Done()
-			for index := range jobs {
-				results <- uploadOneChunk(r, uploadURL, ukey, chunks, index, poster)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case index, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					res := uploadOneChunk(ctx, r, uploadURL, ukey, chunks, index, poster)
+					if res.err != nil {
+						cancel()
+						results <- res
+						return
+					}
+					select {
+					case results <- res:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}()
 	}
 	go func() {
+		defer close(jobs)
 		for index := 0; index < last; index++ {
-			jobs <- index
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(jobs)
+	}()
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
@@ -1574,16 +1923,13 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 			continue
 		}
 		macs[res.index] = res.mac
-		if len(res.body) > 0 {
-			completion = string(res.body)
-		}
 		reportProgress(res.size)
 	}
 	if firstErr != nil {
 		return "", nil, firstErr
 	}
 
-	res := uploadOneChunk(r, uploadURL, ukey, chunks, last, poster)
+	res := uploadOneChunk(ctx, r, uploadURL, ukey, chunks, last, poster)
 	if res.err != nil {
 		return "", nil, fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
 	}
@@ -1595,7 +1941,7 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 	return completion, macs, nil
 }
 
-func uploadOneChunk(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunkSize, index int, poster uploadChunkPoster) uploadChunkResult {
+func uploadOneChunk(ctx context.Context, r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunkSize, index int, poster uploadChunkPoster) uploadChunkResult {
 	ch := chunks[index]
 	res := uploadChunkResult{index: index, size: ch.size}
 	buf := make([]byte, ch.size)
@@ -1610,7 +1956,7 @@ func uploadOneChunk(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chu
 		res.err = err
 		return res
 	}
-	body, err := poster(uploadURL, ch.position, encData)
+	body, err := poster(ctx, uploadURL, ch.position, encData)
 	if err != nil {
 		res.err = err
 		return res
@@ -1703,8 +2049,10 @@ func (c *apiClient) call(payload any, query url.Values, out any) error {
 	}
 	hashcash := ""
 	for attempt := 0; attempt < 6; attempt++ {
-		req, err := http.NewRequest("POST", u, bytes.NewReader(body))
+		ctx, cancel := context.WithTimeout(context.Background(), apiRequestTimeout)
+		req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
 		if err != nil {
+			cancel()
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -1714,10 +2062,12 @@ func (c *apiClient) call(payload any, query url.Values, out any) error {
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return err
+			cancel()
+			return sanitizeHTTPError(err, req.URL)
 		}
-		resBody, readErr := io.ReadAll(resp.Body)
+		resBody, readErr := readBoundedResponse(resp.Body, maxAPIResponseSize)
 		resp.Body.Close()
+		cancel()
 		if readErr != nil {
 			return readErr
 		}
@@ -1770,18 +2120,20 @@ func (c *apiClient) call(payload any, query url.Values, out any) error {
 	return errors.New("API hashcash challenge did not resolve after retries")
 }
 
-func postUploadChunk(uploadURL string, offset int64, data []byte) ([]byte, error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%d", uploadURL, offset), bytes.NewReader(data))
+func postUploadChunk(parent context.Context, uploadURL string, offset int64, data []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, uploadChunkTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/%d", uploadURL, offset), bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeHTTPError(err, req.URL)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxUploadResponseSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1792,6 +2144,42 @@ func postUploadChunk(uploadURL string, offset int64, data []byte) ([]byte, error
 		return nil, apiError{Code: code, Body: strings.TrimSpace(string(body))}
 	}
 	return body, nil
+}
+
+func newHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   connectionSetupTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = connectionSetupTimeout
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport}
+}
+
+func readBoundedResponse(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("HTTP response exceeds %d bytes", limit)
+	}
+	return body, nil
+}
+
+func sanitizeHTTPError(err error, requestURL *url.URL) error {
+	detail := err.Error()
+	safeTarget := requestURL.Scheme + "://" + requestURL.Host
+	detail = strings.ReplaceAll(detail, requestURL.String(), safeTarget)
+	query := requestURL.Query()
+	for _, values := range query {
+		for _, value := range values {
+			detail = strings.ReplaceAll(detail, value, "[redacted]")
+			detail = strings.ReplaceAll(detail, url.QueryEscape(value), "[redacted]")
+		}
+	}
+	return errors.New(detail)
 }
 
 func encryptUploadChunk(chunk []byte, ukey []uint32, offset int64) ([]byte, []byte, error) {
@@ -1937,7 +2325,10 @@ func encryptAttr(attrs map[string]any, key []uint32) (string, error) {
 	}
 	buf := append([]byte("MEGA"), data...)
 	buf = padNull(buf, aes.BlockSize)
-	aesKey := attrAESKey(key)
+	aesKey, err := attrAESKey(key)
+	if err != nil {
+		return "", err
+	}
 	block, err := aes.NewCipher(wordsToBytes(aesKey))
 	if err != nil {
 		return "", err
@@ -1955,14 +2346,17 @@ func decryptNodeName(attr64, key64 string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if len(attr)%aes.BlockSize != 0 {
+		return "", errors.New("attribute block is not AES-aligned")
+	}
 	keyWords := bytesToWords(keyBytes)
-	aesKey := attrAESKey(keyWords)
-	block, err := aes.NewCipher(wordsToBytes(aesKey))
+	aesKey, err := attrAESKey(keyWords)
 	if err != nil {
 		return "", err
 	}
-	if len(attr)%aes.BlockSize != 0 {
-		return "", errors.New("attribute block is not AES-aligned")
+	block, err := aes.NewCipher(wordsToBytes(aesKey))
+	if err != nil {
+		return "", err
 	}
 	cipher.NewCBCDecrypter(block, make([]byte, aes.BlockSize)).CryptBlocks(attr, attr)
 	attr = bytes.TrimRight(attr, "\x00")
@@ -1979,11 +2373,15 @@ func decryptNodeName(attr64, key64 string) (string, error) {
 	return "", nil
 }
 
-func attrAESKey(key []uint32) []uint32 {
-	if len(key) >= 8 {
-		return []uint32{key[0] ^ key[4], key[1] ^ key[5], key[2] ^ key[6], key[3] ^ key[7]}
+func attrAESKey(key []uint32) ([]uint32, error) {
+	switch len(key) {
+	case 4:
+		return append([]uint32(nil), key...), nil
+	case 8:
+		return []uint32{key[0] ^ key[4], key[1] ^ key[5], key[2] ^ key[6], key[3] ^ key[7]}, nil
+	default:
+		return nil, fmt.Errorf("attribute key must contain 4 or 8 words, got %d", len(key))
 	}
-	return key[:4]
 }
 
 func deriveTransferPassword(xh, password string) (string, error) {
@@ -2055,6 +2453,9 @@ func bytesToWords(buf []byte) []uint32 {
 }
 
 func encryptWords(key, words []uint32) ([]uint32, error) {
+	if len(words)%4 != 0 {
+		return nil, fmt.Errorf("plaintext must contain complete AES blocks, got %d words", len(words))
+	}
 	block, err := aes.NewCipher(wordsToBytes(key))
 	if err != nil {
 		return nil, err
@@ -2068,6 +2469,9 @@ func encryptWords(key, words []uint32) ([]uint32, error) {
 }
 
 func decryptWords(key, words []uint32) ([]uint32, error) {
+	if len(words)%4 != 0 {
+		return nil, fmt.Errorf("ciphertext must contain complete AES blocks, got %d words", len(words))
+	}
 	block, err := aes.NewCipher(wordsToBytes(key))
 	if err != nil {
 		return nil, err
@@ -2174,7 +2578,18 @@ func saveSavedConfig(cfg savedConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	st, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("config directory is not a regular directory: %s", dir)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -2182,14 +2597,28 @@ func saveSavedConfig(cfg savedConfig) error {
 		return err
 	}
 	data = append(data, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(tmp, 0600); err != nil {
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0600)
@@ -2204,7 +2633,6 @@ func saveAccountSession(email, passwordToStore string, sess session) error {
 		Email:     normalizeEmail(email),
 		Password:  passwordToStore,
 		SID:       sess.sid,
-		MasterKey: b64Encode(wordsToBytes(sess.masterKey)),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	return saveSavedConfig(cfg)
@@ -2306,17 +2734,6 @@ func apiRetryDelay(attempt int) time.Duration {
 	return time.Duration(250*(1<<attempt)) * time.Millisecond
 }
 
-func decodeSavedWords(encoded string) []uint32 {
-	if encoded == "" {
-		return nil
-	}
-	data, err := b64Decode(encoded)
-	if err != nil || len(data)%4 != 0 {
-		return nil
-	}
-	return bytesToWords(data)
-}
-
 func stringToWords(s string) []uint32 {
 	data := []byte(s)
 	if rem := len(data) % 4; rem != 0 {
@@ -2398,8 +2815,58 @@ func safeName(s string) string {
 	if s == "" {
 		return "unnamed"
 	}
-	replacer := strings.NewReplacer("/", "_", "\\", "_", "\x00", "")
-	return replacer.Replace(s)
+	replacer := strings.NewReplacer(
+		"/", "_", "\\", "_", "\x00", "",
+		"<", "_", ">", "_", ":", "_", "\"", "_",
+		"|", "_", "?", "_", "*", "_",
+	)
+	s = replacer.Replace(s)
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		return r
+	}, s)
+	if s == "." || s == ".." {
+		s = "_" + s
+	}
+	s = strings.TrimRight(s, " .")
+	if s == "" {
+		return "unnamed"
+	}
+	base := strings.TrimRight(strings.ToUpper(strings.SplitN(s, ".", 2)[0]), " ")
+	if isWindowsReservedName(base) || looksLikeWindowsShortName(base) {
+		return "_" + s
+	}
+	return s
+}
+
+func isWindowsReservedName(base string) bool {
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" || base == "CONIN$" || base == "CONOUT$" {
+		return true
+	}
+	runes := []rune(base)
+	if len(runes) != 4 || (string(runes[:3]) != "COM" && string(runes[:3]) != "LPT") {
+		return false
+	}
+	return (runes[3] >= '1' && runes[3] <= '9') || runes[3] == '¹' || runes[3] == '²' || runes[3] == '³'
+}
+
+func looksLikeWindowsShortName(base string) bool {
+	tilde := strings.LastIndexByte(base, '~')
+	if tilde < 1 || tilde == len(base)-1 {
+		return false
+	}
+	prefixLength := len([]rune(base[:tilde]))
+	if prefixLength < 1 || prefixLength > 6 {
+		return false
+	}
+	for _, r := range base[tilde+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func copyWithProgress(dst io.Writer, src io.Reader, done, total int64) error {
@@ -2409,8 +2876,12 @@ func copyWithProgress(dst io.Writer, src io.Reader, done, total int64) error {
 	for {
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			if _, err := dst.Write(buf[:n]); err != nil {
+			written, err := dst.Write(buf[:n])
+			if err != nil {
 				return err
+			}
+			if written != n {
+				return io.ErrShortWrite
 			}
 			done += int64(n)
 			if time.Now().After(nextPrint) || done == total {
