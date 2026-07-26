@@ -144,9 +144,16 @@ Examples:
 - Partial downloads are staged in `.part` files and resumed with an HTTP `Range`
   request. If integrity verification fails after resume, the file is downloaded
   again from byte 0. A verified staged file atomically replaces the destination.
+- Transient download failures (connection resets, stalls, truncated bodies, HTTP
+  `429` and `5xx`) are retried, resuming from whatever already reached the `.part`
+  file. If the server refuses the resume range, the file restarts from byte 0.
 - Multi-file or directory transfers are placed inside a subdirectory named after
   the transfer title.
 - Empty folders are recreated when downloading directory transfers.
+- Two remote names can map to one local path after sanitization or case/Unicode
+  folding (`README.md` and `readme.md`, or `report:v1` and `report?v1`). Files are
+  then written as `name (1).ext`, `name (2).ext`, … and the rename is reported;
+  folders merge into one directory. No two nodes ever write to the same file.
 
 ## Upload Usage
 
@@ -285,10 +292,19 @@ plaintext. This is convenient for automation, but it means anyone who can read
 that config file can use the account. On Windows, access is controlled by the
 ACL inherited from `%AppData%`; ensure that directory is private to your user.
 
+A password already stored with `--save-password` is retained for the same account
+when you log in again without the flag, so an ordinary re-login does not silently
+strip a credential that unattended runs depend on. Logging in as a different email
+drops the previous account's password. Use `account logout` to remove it.
+
 MEGA may return a login proof-of-work challenge through the `X-Hashcash`
-header. The CLI solves that challenge automatically before retrying the login.
+header. The CLI solves that challenge automatically before retrying the login;
+the search runs across up to four cores and gives up rather than spinning forever
+on an implausibly hard challenge.
 The API client also retries transient MEGA/transfer.it failures such as API
-`-3`, API `-4`, HTTP `429`, and common `5xx` gateway/server responses.
+`-3`, API `-4`, HTTP `429`, and common `5xx` gateway/server responses. Upload
+chunk POSTs are retried on the same conditions, so one blip no longer discards an
+entire multi-gigabyte upload.
 
 ## Directory Handling
 

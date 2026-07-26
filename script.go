@@ -6,7 +6,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -16,7 +16,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
 	"math"
 	"math/big"
@@ -28,9 +27,11 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/text/cases"
@@ -39,7 +40,6 @@ import (
 
 const (
 	megaAPI                = "https://g.api.mega.co.nz"
-	transferAPI            = "https://bt7.api.mega.co.nz"
 	origin                 = "https://transfer.it"
 	maxAPIResponseSize     = 8 << 20
 	maxUploadResponseSize  = 1 << 20
@@ -48,11 +48,37 @@ const (
 	apiRequestTimeout      = 2 * time.Minute
 	uploadChunkTimeout     = 2 * time.Minute
 	downloadIdleTimeout    = 2 * time.Minute
+	uploadChunkAttempts    = 5
+	downloadAttempts       = 4
+	maxPathDisambiguation  = 200
+
+	hashcashPrefixSize = 4
+	hashcashIterations = 262144
+	hashcashChunkSize  = 48
 )
 
+// hashcashMaxAttempts bounds the proof-of-work search. Each attempt hashes a 12 MiB
+// buffer (~8 ms), and a legitimate challenge resolves in well under a thousand
+// attempts, so this leaves ample headroom for a server-side difficulty bump while
+// capping the worst case at roughly half a minute on four cores.
+var hashcashMaxAttempts = 1 << 14
+
 var (
+	// transferAPI is a var only so tests can point the download path at httptest.
+	transferAPI = "https://bt7.api.mega.co.nz"
+
 	httpClient = newHTTPClient()
 	linkRE     = regexp.MustCompile("(?i)(?:^|[\\s<(\"'`])(?:https?://)?(?:www\\.)?transfer\\.it/t/([A-Za-z0-9_-]+)")
+
+	// stdinReader is shared by every prompt: bufio reads ahead, so a per-prompt
+	// reader would swallow the rest of a piped script after the first line.
+	stdinReader = bufio.NewReader(os.Stdin)
+
+	// errDownloadTransient marks failures worth retrying with the bytes already on
+	// disk; errRangeRejected marks a resume the server refused, which is only
+	// recoverable by restarting the file from byte zero.
+	errDownloadTransient = errors.New("transient download failure")
+	errRangeRejected     = errors.New("server rejected the resume range")
 )
 
 type apiClient struct {
@@ -146,7 +172,9 @@ func main() {
 		err = runUpload(os.Args[2:])
 	case cmd == "account":
 		err = runAccount(os.Args[2:])
-	case strings.HasPrefix(cmd, "http://") || strings.HasPrefix(cmd, "https://"):
+	// Accept a bare "transfer.it/t/HANDLE" too: parseTransferHandle already does, so
+	// rejecting it here as an unknown command was an inconsistency.
+	case strings.HasPrefix(cmd, "http://") || strings.HasPrefix(cmd, "https://") || linkRE.MatchString(cmd):
 		err = runDownload(os.Args[1:])
 	case cmd == "-h" || cmd == "--help" || cmd == "help":
 		usage()
@@ -277,7 +305,7 @@ func runDownload(args []string) error {
 		}
 	}
 
-	seenPaths := map[string]string{}
+	seenPaths := map[string]reservedPath{}
 	folderPaths := make([]string, 0, len(folders))
 	for _, folder := range folders {
 		if folder.P == "" || folder.Path == "" {
@@ -287,7 +315,7 @@ func runDownload(args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid folder path %q: %w", folder.Path, err)
 		}
-		if err := reserveDownloadPath(seenPaths, dst, "folder "+folder.Path); err != nil {
+		if err := reserveFolderPath(seenPaths, dst, "folder "+folder.Path); err != nil {
 			return err
 		}
 		folderPaths = append(folderPaths, dst)
@@ -307,13 +335,14 @@ func runDownload(args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid file path %q: %w", rel, err)
 		}
-		if err := reserveDownloadPath(seenPaths, dst, "file "+rel); err != nil {
+		reserved, err := reserveFilePath(seenPaths, dst, "file "+rel)
+		if err != nil {
 			return err
 		}
-		if err := reserveDownloadPath(seenPaths, dst+".part", "partial file "+rel); err != nil {
-			return err
+		if reserved != dst {
+			fmt.Printf("Renaming %s to %s to avoid a local name collision\n", rel, filepath.Base(reserved))
 		}
-		downloads = append(downloads, fileDownload{node: file, dst: dst})
+		downloads = append(downloads, fileDownload{node: file, dst: reserved})
 	}
 
 	if err := rejectSymlinkComponents(outputRoot, baseDir); err != nil {
@@ -464,10 +493,7 @@ func runAccountLogin(args []string) error {
 		return nil
 	}
 
-	passwordToStore := ""
-	if *savePassword {
-		passwordToStore = loginPassword
-	}
+	passwordToStore := passwordToPersist(cfg, loginEmail, loginPassword, *savePassword, false)
 	if err := saveAccountSession(loginEmail, passwordToStore, sess); err != nil {
 		return err
 	}
@@ -574,10 +600,7 @@ func resolveUploadSession(useAccount bool, accountEmail, accountPassword, mfa st
 			return session{}, "", err
 		}
 
-		passwordToStore := ""
-		if savePassword || passwordFromConfig {
-			passwordToStore = password
-		}
+		passwordToStore := passwordToPersist(cfg, email, password, savePassword, passwordFromConfig)
 		if err := saveAccountSession(email, passwordToStore, sess); err != nil {
 			return session{}, "", err
 		}
@@ -604,10 +627,7 @@ func resolveUploadSession(useAccount bool, accountEmail, accountPassword, mfa st
 	if err != nil {
 		return session{}, "", err
 	}
-	passwordToStore := ""
-	if savePassword {
-		passwordToStore = password
-	}
+	passwordToStore := passwordToPersist(cfg, email, password, savePassword, false)
 	if err := saveAccountSession(email, passwordToStore, sess); err != nil {
 		return session{}, "", err
 	}
@@ -652,10 +672,7 @@ func refreshAccountSession(accountEmail, accountPassword, mfa string, savePasswo
 	if err != nil {
 		return session{}, "", err
 	}
-	passwordToStore := ""
-	if savePassword || passwordFromConfig {
-		passwordToStore = password
-	}
+	passwordToStore := passwordToPersist(cfg, email, password, savePassword, passwordFromConfig)
 	if err := saveAccountSession(email, passwordToStore, sess); err != nil {
 		return session{}, "", err
 	}
@@ -1050,13 +1067,62 @@ func rejectSymlinkComponents(baseDir, dst string) error {
 	return nil
 }
 
-func reserveDownloadPath(seen map[string]string, dst, label string) error {
+// reservedPath records which remote node claimed a local destination, and whether
+// that destination is a directory. Two remote names that are distinct on the server
+// can still land on the same local path after safeName sanitization or Unicode/case
+// folding, so every destination is reserved before the first byte is fetched.
+type reservedPath struct {
+	label string
+	isDir bool
+}
+
+// reserveFolderPath claims dst for a directory. Directories merge on collision:
+// renaming one would be unsound because buildNodePath derives child paths
+// independently and would not follow the rename. Real conflicts between their
+// contents are caught later by reserveFilePath.
+func reserveFolderPath(seen map[string]reservedPath, dst, label string) error {
 	key := portableDownloadPathKey(dst)
 	if prev, ok := seen[key]; ok {
-		return fmt.Errorf("download path collision: %s and %s both map to %s", prev, label, filepath.Clean(dst))
+		if !prev.isDir {
+			return fmt.Errorf("download path collision: %s and %s both map to %s", prev.label, label, filepath.Clean(dst))
+		}
+		return nil
 	}
-	seen[key] = label
+	seen[key] = reservedPath{label: label, isDir: true}
 	return nil
+}
+
+// reserveFilePath claims dst and its .part sidecar for a file, appending " (n)" to
+// the stem until both are free. Disambiguating keeps the rest of the transfer
+// downloadable instead of failing the whole run over one collision, while still
+// guaranteeing no two nodes ever write to the same local file.
+func reserveFilePath(seen map[string]reservedPath, dst, label string) (string, error) {
+	dir, base := filepath.Split(dst)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	candidate := dst
+	for n := 1; ; n++ {
+		key := portableDownloadPathKey(candidate)
+		partKey := portableDownloadPathKey(candidate + ".part")
+		prev, taken := seen[key]
+		prevPart, partTaken := seen[partKey]
+		if !taken && !partTaken {
+			seen[key] = reservedPath{label: label}
+			seen[partKey] = reservedPath{label: "partial " + label}
+			return candidate, nil
+		}
+		if (taken && prev.isDir) || (partTaken && prevPart.isDir) {
+			blocker := prev.label
+			if prevPart.isDir {
+				blocker = prevPart.label
+			}
+			return "", fmt.Errorf("download path collision: %s and %s both map to %s", blocker, label, filepath.Clean(candidate))
+		}
+		if n > maxPathDisambiguation {
+			return "", fmt.Errorf("could not find a free download path for %s near %s", label, filepath.Clean(dst))
+		}
+		candidate = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, n, ext))
+	}
 }
 
 func portableDownloadPathKey(path string) string {
@@ -1109,13 +1175,13 @@ func downloadNode(root *os.Root, xh, pwToken string, n transferNode, rel, displa
 		existing = 0
 	}
 
-	if err := downloadNodeBytes(root, xh, pwToken, n, partRel, displayPath+".part", existing); err != nil {
+	if err := downloadNodeWithRetry(root, xh, pwToken, n, partRel, displayPath+".part", existing); err != nil {
 		return err
 	}
 	if err := verifyDownloadedFileInRoot(root, partRel, n); err != nil {
 		if existing > 0 {
 			fmt.Printf("Integrity check failed after resume, retrying from start: %v\n", err)
-			if err := downloadNodeBytes(root, xh, pwToken, n, partRel, displayPath+".part", 0); err != nil {
+			if err := downloadNodeWithRetry(root, xh, pwToken, n, partRel, displayPath+".part", 0); err != nil {
 				return err
 			}
 			if retryErr := verifyDownloadedFileInRoot(root, partRel, n); retryErr != nil {
@@ -1126,6 +1192,37 @@ func downloadNode(root *os.Root, xh, pwToken string, n transferNode, rel, displa
 		}
 	}
 	return root.Rename(partRel, rel)
+}
+
+// downloadNodeWithRetry fetches a node into its .part file, absorbing transient
+// network failures instead of aborting every remaining file in the transfer. Each
+// attempt re-measures what actually landed on disk and resumes from there; only a
+// resume the server explicitly refuses restarts from byte zero, because
+// downloadNodeBytes truncates when existing == 0.
+func downloadNodeWithRetry(root *os.Root, xh, pwToken string, n transferNode, rel, displayPath string, existing int64) error {
+	var lastErr error
+	for attempt := 0; attempt < downloadAttempts; attempt++ {
+		err := downloadNodeBytes(root, xh, pwToken, n, rel, displayPath, existing)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		switch {
+		case errors.Is(err, errRangeRejected) && existing > 0:
+			fmt.Printf("Server refused to resume %s, restarting from the beginning: %v\n", displayPath, err)
+			existing = 0
+		case errors.Is(err, errDownloadTransient) && attempt < downloadAttempts-1:
+			time.Sleep(apiRetryDelay(attempt))
+			existing = 0
+			if st, statErr := root.Lstat(rel); statErr == nil && st.Mode().IsRegular() && st.Size() <= n.S {
+				existing = st.Size()
+			}
+			fmt.Printf("Download of %s failed (%v); retrying from %d bytes\n", displayPath, err, existing)
+		default:
+			return err
+		}
+	}
+	return lastErr
 }
 
 func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, displayPath string, existing int64) error {
@@ -1146,7 +1243,7 @@ func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, d
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return sanitizeHTTPError(err, req.URL)
+		return fmt.Errorf("%w: %w", errDownloadTransient, sanitizeHTTPError(err, req.URL))
 	}
 	defer resp.Body.Close()
 	if existing > 0 && resp.StatusCode == http.StatusOK {
@@ -1154,14 +1251,21 @@ func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, d
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(idleTimeoutReader{reader: resp.Body, timeout: downloadIdleTimeout}, 4096))
-		return fmt.Errorf("download HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		statusErr := fmt.Errorf("download HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		switch {
+		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+			return fmt.Errorf("%w: %w", errRangeRejected, statusErr)
+		case isTransientHTTPStatus(resp.StatusCode):
+			return fmt.Errorf("%w: %w", errDownloadTransient, statusErr)
+		}
+		return statusErr
 	}
 	if resp.StatusCode == http.StatusPartialContent {
 		if existing == 0 {
 			return errors.New("download server returned an unexpected partial response")
 		}
 		if err := validateContentRange(resp.Header.Get("Content-Range"), existing, n.S); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errRangeRejected, err)
 		}
 	}
 
@@ -1181,7 +1285,8 @@ func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, d
 	copyErr := copyWithProgress(f, limited, existing, n.S)
 	closeErr := f.Close()
 	if copyErr != nil {
-		return copyErr
+		// A reset or stall mid-body is retryable; the bytes already flushed stay put.
+		return fmt.Errorf("%w: %w", errDownloadTransient, copyErr)
 	}
 	if closeErr != nil {
 		return closeErr
@@ -1194,7 +1299,7 @@ func downloadNodeBytes(root *os.Root, xh, pwToken string, n transferNode, rel, d
 		return err
 	}
 	if st.Size() != n.S {
-		return fmt.Errorf("download ended at %d bytes, want %d", st.Size(), n.S)
+		return fmt.Errorf("%w: download ended at %d bytes, want %d", errDownloadTransient, st.Size(), n.S)
 	}
 	return nil
 }
@@ -1241,7 +1346,7 @@ func (r idleTimeoutReader) Read(p []byte) (int, error) {
 	case result := <-resultCh:
 		return result.n, result.err
 	case <-timer.C:
-		return 0, fmt.Errorf("download stalled for %s", r.timeout)
+		return 0, fmt.Errorf("%w: download stalled for %s", errDownloadTransient, r.timeout)
 	}
 }
 
@@ -1303,15 +1408,6 @@ func decodeFileKey(key64 string) ([]uint32, error) {
 	return keyWords[:8], nil
 }
 
-func computeFileKeyFromPlaintext(path string, fileKey []uint32, size int64) ([]uint32, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return computeFileKeyFromReader(f, fileKey, size)
-}
-
 func computeFileKeyFromReader(f io.ReaderAt, fileKey []uint32, size int64) ([]uint32, error) {
 	if len(fileKey) < 8 {
 		return nil, fmt.Errorf("file key is too short: %d words", len(fileKey))
@@ -1324,25 +1420,62 @@ func computeFileKeyFromReader(f io.ReaderAt, fileKey []uint32, size int64) ([]ui
 		fileKey[4],
 		fileKey[5],
 	}
-	chunks := getChunkSizes(size)
-	if len(chunks) == 0 {
-		chunks = []chunkSize{{position: 0, size: 0}}
+	// A zero-length file has no chunks at all, so its meta-MAC condenses to [0, 0].
+	// Feeding buildFileKey a synthetic empty chunk would instead yield AES(k, 0) and
+	// disagree with every other MEGA client.
+	macs, err := chunkMACs(f, ukey, getChunkSizes(size))
+	if err != nil {
+		return nil, err
 	}
+	return buildFileKey(ukey, macs)
+}
+
+// chunkMACs is the read-only counterpart to encryptUploadChunk: it produces the same
+// per-chunk CBC-MACs without the AES-CTR pass or the per-chunk allocations, which is
+// all the download verification path needs.
+func chunkMACs(f io.ReaderAt, ukey []uint32, chunks []chunkSize) ([][]byte, error) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	if len(ukey) < 6 {
+		return nil, fmt.Errorf("upload key is too short: %d words", len(ukey))
+	}
+	block, err := aes.NewCipher(wordsToBytes(ukey[:4]))
+	if err != nil {
+		return nil, err
+	}
+	iv := wordsToBytes([]uint32{ukey[4], ukey[5], ukey[4], ukey[5]})
+	largest := 0
+	for _, ch := range chunks {
+		if ch.size > largest {
+			largest = ch.size
+		}
+	}
+	scratch := make([]byte, largest+aes.BlockSize)
 	macs := make([][]byte, 0, len(chunks))
 	for _, ch := range chunks {
-		buf := make([]byte, ch.size)
+		mac := make([]byte, aes.BlockSize)
 		if ch.size > 0 {
-			if _, err := f.ReadAt(buf, ch.position); err != nil {
+			padded := scratch[:paddedLen(ch.size, aes.BlockSize)]
+			if _, err := f.ReadAt(padded[:ch.size], ch.position); err != nil {
 				return nil, err
 			}
-		}
-		_, mac, err := encryptUploadChunk(buf, ukey, ch.position)
-		if err != nil {
-			return nil, err
+			// scratch still holds the previous chunk, so the null padding must be
+			// re-zeroed or a short trailing chunk MACs stale bytes.
+			clear(padded[ch.size:])
+			cipher.NewCBCEncrypter(block, iv).CryptBlocks(padded, padded)
+			copy(mac, padded[len(padded)-aes.BlockSize:])
 		}
 		macs = append(macs, mac)
 	}
-	return buildFileKey(ukey, macs)
+	return macs, nil
+}
+
+func paddedLen(n, blockSize int) int {
+	if rem := n % blockSize; rem != 0 {
+		return n + blockSize - rem
+	}
+	return n
 }
 
 func createAnonymousSession() (session, error) {
@@ -1545,7 +1678,10 @@ func deriveMegaV2Login(password, salt64 string) ([]uint32, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	key := pbkdf2([]byte(password), salt, 100000, 32, sha512.New)
+	key, err := pbkdf2.Key(sha512.New, password, salt, 100000, 32)
+	if err != nil {
+		return nil, "", err
+	}
 	return bytesToWords(key[:16]), b64Encode(key[16:]), nil
 }
 
@@ -1657,7 +1793,13 @@ func sidFromCSID(csid64, privk64 string, masterKey []uint32) (string, error) {
 	if err != nil {
 		encryptedSID = new(big.Int).SetBytes(csidBytes)
 	}
+	// readMPI happily returns zero for a zero-length MPI, and big.Int.Exp treats a
+	// zero modulus as "no modular reduction" — an exact integer power with an
+	// exponent up to 2^65535 that would hang the process until it is OOM-killed.
 	modulus := new(big.Int).Mul(p, q)
+	if modulus.BitLen() < 512 || d.BitLen() > modulus.BitLen() {
+		return "", errors.New("invalid RSA private key material in login response")
+	}
 	plainSID := new(big.Int).Exp(encryptedSID, d, modulus).Bytes()
 	if len(plainSID) < 43 {
 		return "", fmt.Errorf("decrypted account session id is too short: %d bytes", len(plainSID))
@@ -1770,6 +1912,8 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, 
 	}
 	chunks := getChunkSizes(size)
 	if len(chunks) == 0 {
+		// An empty file still has to POST one zero-length chunk to get a completion
+		// handle back; its MAC is dropped below so the key matches MEGA's.
 		chunks = []chunkSize{{position: 0, size: 0}}
 	}
 	fmt.Printf("Uploading %s (%d bytes)\n", displayPath, size)
@@ -1789,6 +1933,10 @@ func uploadFile(api *apiClient, root, filePath, remoteName, displayPath string, 
 		return uploadResult{}, errors.New("upload server did not return a completion handle")
 	}
 
+	if size == 0 {
+		// MEGA condenses no chunk MACs at all for an empty file, giving meta-MAC [0, 0].
+		macs = nil
+	}
 	fileKey, err := buildFileKey(ukey, macs)
 	if err != nil {
 		return uploadResult{}, err
@@ -1917,7 +2065,9 @@ func uploadChunks(r io.ReaderAt, uploadURL string, ukey []uint32, chunks []chunk
 	var firstErr error
 	for res := range results {
 		if res.err != nil {
-			if firstErr == nil {
+			// Prefer the failure that triggered cancel() over the context.Canceled
+			// that every sibling worker reports afterwards.
+			if firstErr == nil || (errors.Is(firstErr, context.Canceled) && !errors.Is(res.err, context.Canceled)) {
 				firstErr = fmt.Errorf("upload chunk at offset %d: %w", chunks[res.index].position, res.err)
 			}
 			continue
@@ -2120,30 +2270,60 @@ func (c *apiClient) call(payload any, query url.Values, out any) error {
 	return errors.New("API hashcash challenge did not resolve after retries")
 }
 
+// postUploadChunk retries transient failures instead of letting one blip cancel the
+// worker pool and discard a multi-gigabyte upload that cannot be resumed. Chunk POSTs
+// are addressed by byte offset and idempotent, so re-posting is safe — including the
+// final chunk, which returns the completion handle again.
 func postUploadChunk(parent context.Context, uploadURL string, offset int64, data []byte) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < uploadChunkAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(apiRetryDelay(attempt - 1)):
+			case <-parent.Done():
+				return nil, parent.Err()
+			}
+		}
+		body, retryable, err := postUploadChunkOnce(parent, uploadURL, offset, data)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		// A sibling worker's failure cancels parent; do not burn the backoff ladder.
+		if !retryable || parent.Err() != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// postUploadChunkOnce reports whether the failure it returns is worth retrying. The
+// per-attempt timeout lives here rather than around the whole loop so a stalled
+// connection that burns the full budget still leaves room for another attempt.
+func postUploadChunkOnce(parent context.Context, uploadURL string, offset int64, data []byte) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(parent, uploadChunkTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/%d", uploadURL, offset), bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, sanitizeHTTPError(err, req.URL)
+		return nil, parent.Err() == nil, sanitizeHTTPError(err, req.URL)
 	}
 	defer resp.Body.Close()
 	body, err := readBoundedResponse(resp.Body, maxUploadResponseSize)
 	if err != nil {
-		return nil, err
+		return nil, parent.Err() == nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upload HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, isTransientHTTPStatus(resp.StatusCode), fmt.Errorf("upload HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	if code, ok := negativeAPICode(body); ok {
-		return nil, apiError{Code: code, Body: strings.TrimSpace(string(body))}
+		return nil, isTransientAPICode(code), apiError{Code: code, Body: strings.TrimSpace(string(body))}
 	}
-	return body, nil
+	return body, false, nil
 }
 
 func newHTTPClient() *http.Client {
@@ -2154,6 +2334,9 @@ func newHTTPClient() *http.Client {
 	}).DialContext
 	transport.TLSHandshakeTimeout = connectionSetupTimeout
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	// DefaultTransport pools only 2 idle connections per host, so parallel upload
+	// workers would re-handshake on every chunk. Match the --upload-workers ceiling.
+	transport.MaxIdleConnsPerHost = 16
 	return &http.Client{Transport: transport}
 }
 
@@ -2175,8 +2358,16 @@ func sanitizeHTTPError(err error, requestURL *url.URL) error {
 	query := requestURL.Query()
 	for _, values := range query {
 		for _, value := range values {
+			// Short values (a one-character file name in fn=, say) match everywhere
+			// and would shred the surrounding message. Every secret carried here —
+			// sid, pw, and the capability-bearing x — is far longer than this.
+			if len(value) < 8 {
+				continue
+			}
 			detail = strings.ReplaceAll(detail, value, "[redacted]")
-			detail = strings.ReplaceAll(detail, url.QueryEscape(value), "[redacted]")
+			if escaped := url.QueryEscape(value); escaped != value {
+				detail = strings.ReplaceAll(detail, escaped, "[redacted]")
+			}
 		}
 	}
 	return errors.New(detail)
@@ -2192,14 +2383,15 @@ func encryptUploadChunk(chunk []byte, ukey []uint32, offset int64) ([]byte, []by
 	encrypted := append([]byte(nil), chunk...)
 	cipher.NewCTR(block, wordsToBytes(ctrWords)).XORKeyStream(encrypted, encrypted)
 
+	// padNull always returns a freshly allocated buffer that never aliases chunk, so
+	// the CBC-MAC can run in place over it. Do not "optimize" padNull to return its
+	// input when already block-aligned: that would encrypt the caller's plaintext.
 	padded := padNull(chunk, aes.BlockSize)
 	mac := make([]byte, aes.BlockSize)
 	if len(padded) > 0 {
-		macBuf := make([]byte, len(padded))
-		copy(macBuf, padded)
 		iv := wordsToBytes([]uint32{ukey[4], ukey[5], ukey[4], ukey[5]})
-		cipher.NewCBCEncrypter(block, iv).CryptBlocks(macBuf, macBuf)
-		copy(mac, macBuf[len(macBuf)-aes.BlockSize:])
+		cipher.NewCBCEncrypter(block, iv).CryptBlocks(padded, padded)
+		copy(mac, padded[len(padded)-aes.BlockSize:])
 	}
 	return encrypted, mac, nil
 }
@@ -2245,17 +2437,15 @@ func generateHashcashToken(challenge string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if easiness < 0 || easiness > 255 {
+		return "", fmt.Errorf("invalid hashcash easiness %d", easiness)
+	}
 	tokenText := parts[3]
 	token, err := decodeFlexibleBase64(tokenText)
 	if err != nil {
 		return "", err
 	}
-	const (
-		prefixSize = 4
-		iterations = 262144
-		chunkSize  = 48
-	)
-	if len(token) < chunkSize {
+	if len(token) < hashcashChunkSize {
 		return "", fmt.Errorf("hashcash token is too short: %d bytes", len(token))
 	}
 
@@ -2269,23 +2459,60 @@ func generateHashcashToken(challenge string) (string, error) {
 		threshold = uint64(^uint32(0))
 	}
 
-	buffer := make([]byte, prefixSize+iterations*chunkSize)
-	for i := 0; i < iterations; i++ {
-		copy(buffer[prefixSize+i*chunkSize:prefixSize+(i+1)*chunkSize], token[:chunkSize])
+	prefix, ok := searchHashcashPrefix(token[:hashcashChunkSize], threshold)
+	if !ok {
+		return "", fmt.Errorf("hashcash challenge too hard (easiness %d): no solution within %d attempts", easiness, hashcashMaxAttempts)
 	}
-	for {
-		sum := sha256.Sum256(buffer)
-		hashPrefix := binary.BigEndian.Uint32(sum[:4])
-		if uint64(hashPrefix) <= threshold {
-			return fmt.Sprintf("1:%s:%s", tokenText, b64Encode(buffer[:prefixSize])), nil
-		}
-		for i := 0; i < prefixSize; i++ {
-			buffer[i]++
-			if buffer[i] != 0 {
-				break
+	return fmt.Sprintf("1:%s:%s", tokenText, b64Encode(prefix)), nil
+}
+
+// searchHashcashPrefix looks for a 4-byte prefix whose SHA-256 over the repeated
+// token falls under threshold. Each hash covers a 12 MiB buffer, so the search is
+// striped across cores; workers take disjoint prefixes and share one attempt budget
+// so a hostile or misconfigured easiness cannot wedge the CLI indefinitely.
+func searchHashcashPrefix(token []byte, threshold uint64) ([]byte, bool) {
+	workers := min(runtime.NumCPU(), 4)
+	if workers < 1 {
+		workers = 1
+	}
+
+	var (
+		remaining = int64(hashcashMaxAttempts)
+		found     atomic.Bool
+		mu        sync.Mutex
+		solution  []byte
+		wg        sync.WaitGroup
+	)
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(start uint32) {
+			defer wg.Done()
+			buffer := make([]byte, hashcashPrefixSize+hashcashIterations*hashcashChunkSize)
+			for i := 0; i < hashcashIterations; i++ {
+				copy(buffer[hashcashPrefixSize+i*hashcashChunkSize:], token)
 			}
-		}
+			for counter := start; !found.Load(); counter += uint32(workers) {
+				if atomic.AddInt64(&remaining, -1) < 0 {
+					return
+				}
+				// The reference implementation increments the prefix bytes low-first,
+				// which is a little-endian uint32 counter starting at zero.
+				binary.LittleEndian.PutUint32(buffer[:hashcashPrefixSize], counter)
+				sum := sha256.Sum256(buffer)
+				if uint64(binary.BigEndian.Uint32(sum[:4])) <= threshold {
+					mu.Lock()
+					if solution == nil {
+						solution = append([]byte(nil), buffer[:hashcashPrefixSize]...)
+					}
+					mu.Unlock()
+					found.Store(true)
+					return
+				}
+			}
+		}(uint32(w))
 	}
+	wg.Wait()
+	return solution, solution != nil
 }
 
 func hashcashChallengeFromBody(body []byte) (string, bool) {
@@ -2394,38 +2621,11 @@ func deriveTransferPassword(xh, password string) (string, error) {
 	}
 	saltPart := raw[len(raw)-6:]
 	salt := append(append(append([]byte{}, saltPart...), saltPart...), saltPart...)
-	key := pbkdf2SHA256([]byte(strings.TrimSpace(password)), salt, 100000, 32)
-	return b64Encode(key), nil
-}
-
-func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
-	return pbkdf2(password, salt, iter, keyLen, sha256.New)
-}
-
-func pbkdf2(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
-	prf := hmac.New(h, password)
-	hashLen := prf.Size()
-	numBlocks := int(math.Ceil(float64(keyLen) / float64(hashLen)))
-	var out []byte
-	for block := 1; block <= numBlocks; block++ {
-		prf.Reset()
-		prf.Write(salt)
-		var ibuf [4]byte
-		binary.BigEndian.PutUint32(ibuf[:], uint32(block))
-		prf.Write(ibuf[:])
-		u := prf.Sum(nil)
-		t := append([]byte(nil), u...)
-		for i := 1; i < iter; i++ {
-			prf.Reset()
-			prf.Write(u)
-			u = prf.Sum(nil)
-			for j := range t {
-				t[j] ^= u[j]
-			}
-		}
-		out = append(out, t...)
+	key, err := pbkdf2.Key(sha256.New, strings.TrimSpace(password), salt, 100000, 32)
+	if err != nil {
+		return "", err
 	}
-	return out[:keyLen]
+	return b64Encode(key), nil
 }
 
 func randomWords(n int) ([]uint32, error) {
@@ -2642,10 +2842,24 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+// passwordToPersist decides whether the account password stays on disk. A password
+// the user already opted into saving is kept — and refreshed — for the same account,
+// so an ordinary re-login does not silently strip the credential that later
+// unattended runs depend on once the saved session expires. Switching accounts drops
+// the previous account's password, which is what logging in as someone else means.
+func passwordToPersist(cfg savedConfig, email, password string, savePassword, passwordFromConfig bool) string {
+	if savePassword || passwordFromConfig {
+		return password
+	}
+	if cfg.Account.Password != "" && strings.EqualFold(normalizeEmail(email), normalizeEmail(cfg.Account.Email)) {
+		return password
+	}
+	return ""
+}
+
 func promptLine(label string) (string, error) {
 	fmt.Print(label)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := stdinReader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
@@ -2668,8 +2882,7 @@ func promptSecret(label string) (string, error) {
 			}()
 		}
 	}
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := stdinReader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
@@ -2810,17 +3023,21 @@ func decodeMaybeBase64(s string) string {
 	return s
 }
 
+// safeNameReplacer is built once: the shrinking "\x00" -> "" rule forces strings onto
+// its generic trie replacer, which is expensive to construct and gets rebuilt for
+// every path component of every node otherwise. Replacers are safe to share.
+var safeNameReplacer = strings.NewReplacer(
+	"/", "_", "\\", "_", "\x00", "",
+	"<", "_", ">", "_", ":", "_", "\"", "_",
+	"|", "_", "?", "_", "*", "_",
+)
+
 func safeName(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "unnamed"
 	}
-	replacer := strings.NewReplacer(
-		"/", "_", "\\", "_", "\x00", "",
-		"<", "_", ">", "_", ":", "_", "\"", "_",
-		"|", "_", "?", "_", "*", "_",
-	)
-	s = replacer.Replace(s)
+	s = safeNameReplacer.Replace(s)
 	s = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
 			return '_'

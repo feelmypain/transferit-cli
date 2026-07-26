@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +39,24 @@ func TestParseTransferHandle(t *testing.T) {
 		}
 		if got != want {
 			t.Fatalf("parseTransferHandle(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+// The bare-host form is dispatched by main() as a download, so the pattern it keys
+// on must agree with parseTransferHandle and must not swallow the subcommands.
+func TestLinkPatternDispatchAgreesWithParsing(t *testing.T) {
+	for _, arg := range []string{"transfer.it/t/Bare42", "https://transfer.it/t/AbC123_-", "www.transfer.it/t/xyz789"} {
+		if !linkRE.MatchString(arg) {
+			t.Fatalf("%q would be rejected as an unknown command", arg)
+		}
+		if _, err := parseTransferHandle(arg); err != nil {
+			t.Fatalf("parseTransferHandle(%q) = %v", arg, err)
+		}
+	}
+	for _, arg := range []string{"download", "upload", "account", "help", "-h", "--help"} {
+		if linkRE.MatchString(arg) {
+			t.Fatalf("subcommand %q was matched as a transfer link", arg)
 		}
 	}
 }
@@ -331,22 +352,118 @@ func TestVerifyDownloadedFileDetectsSameSizeCorruption(t *testing.T) {
 	}
 }
 
-func TestReserveDownloadPathDetectsCollision(t *testing.T) {
-	seen := map[string]string{}
-	dst := filepath.Join(t.TempDir(), "same")
-	if err := reserveDownloadPath(seen, dst, "file a/b"); err != nil {
+func TestZeroLengthFileMetaMACMatchesMEGA(t *testing.T) {
+	ukey := []uint32{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718}
+	// MEGA condenses no chunk MACs at all for an empty file.
+	fileKey, err := buildFileKey(ukey, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	err := reserveDownloadPath(seen, filepath.Clean(dst), "file a_b")
-	if err == nil {
-		t.Fatal("expected collision")
+	if fileKey[6] != 0 || fileKey[7] != 0 {
+		t.Fatalf("empty-file meta-MAC = %08x %08x, want 0 0", fileKey[6], fileKey[7])
 	}
-	if !strings.Contains(err.Error(), "download path collision") {
+	computed, err := computeFileKeyFromReader(bytes.NewReader(nil), fileKey, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wordsEqual(computed, fileKey) {
+		t.Fatalf("zero-length file failed its own verification: %v vs %v", computed, fileKey)
+	}
+}
+
+func TestChunkMACsMatchEncryptUploadChunk(t *testing.T) {
+	ukey := []uint32{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718}
+	for _, size := range []int{1, 15, 16, 17, 131072, 131073, 393217, 1048576, 3*1024*1024 + 5} {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte((i*37 + 11) & 0xff)
+		}
+		chunks := getChunkSizes(int64(size))
+		want := make([][]byte, 0, len(chunks))
+		for _, ch := range chunks {
+			_, mac, err := encryptUploadChunk(data[ch.position:ch.position+int64(ch.size)], ukey, ch.position)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want = append(want, mac)
+		}
+		// A short trailing chunk after a large one catches stale scratch-buffer bytes.
+		got, err := chunkMACs(bytes.NewReader(data), ukey, chunks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("size %d: chunkMACs disagrees with encryptUploadChunk", size)
+		}
+	}
+}
+
+func TestEncryptUploadChunkDoesNotMutateInput(t *testing.T) {
+	ukey := []uint32{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718}
+	for _, size := range []int{0, 1, 15, 16, 17, 64} {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i + 1)
+		}
+		original := append([]byte(nil), data...)
+		if _, _, err := encryptUploadChunk(data, ukey, 0); err != nil {
+			t.Fatal(err)
+		}
+		// The MAC runs in place over padNull's buffer, which must never alias chunk.
+		if !bytes.Equal(data, original) {
+			t.Fatalf("size %d: encryptUploadChunk mutated its input", size)
+		}
+	}
+}
+
+func TestReserveFilePathDisambiguatesCollision(t *testing.T) {
+	seen := map[string]reservedPath{}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "same.txt")
+	first, err := reserveFilePath(seen, dst, "file a/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != dst {
+		t.Fatalf("first reservation = %q, want %q", first, dst)
+	}
+	second, err := reserveFilePath(seen, filepath.Clean(dst), "file a_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "same (1).txt"); second != want {
+		t.Fatalf("second reservation = %q, want %q", second, want)
+	}
+	third, err := reserveFilePath(seen, dst, "file a-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "same (2).txt"); third != want {
+		t.Fatalf("third reservation = %q, want %q", third, want)
+	}
+}
+
+func TestReserveFolderPathMergesAndBlocksFileConflicts(t *testing.T) {
+	root := t.TempDir()
+	seen := map[string]reservedPath{}
+	dst := filepath.Join(root, "shared")
+	if err := reserveFolderPath(seen, dst, "folder a/shared"); err != nil {
+		t.Fatal(err)
+	}
+	// Two remote folders that sanitize to the same local path merge rather than fail;
+	// renaming would be unsound because child paths are derived independently.
+	if err := reserveFolderPath(seen, dst, "folder b/shared"); err != nil {
+		t.Fatalf("folder reservations did not merge: %v", err)
+	}
+	// A file landing on a reserved directory is still a hard error.
+	if _, err := reserveFilePath(seen, dst, "file shared"); err == nil {
+		t.Fatal("file was allowed to claim a reserved folder path")
+	} else if !strings.Contains(err.Error(), "download path collision") {
 		t.Fatalf("collision error = %v", err)
 	}
 }
 
-func TestReserveDownloadPathDetectsPortableCollisions(t *testing.T) {
+func TestReserveFilePathSeparatesPortableCollisions(t *testing.T) {
 	root := t.TempDir()
 	for _, paths := range [][2]string{
 		{"File.txt", "file.txt"},
@@ -355,21 +472,26 @@ func TestReserveDownloadPathDetectsPortableCollisions(t *testing.T) {
 		{"é.txt", "é.txt"},
 		{"Straße.txt", "STRASSE.txt"},
 	} {
-		seen := map[string]string{}
-		first := filepath.Join(root, paths[0])
-		second := filepath.Join(root, paths[1])
-		if err := reserveDownloadPath(seen, first, "first"); err != nil {
+		seen := map[string]reservedPath{}
+		first, err := reserveFilePath(seen, filepath.Join(root, paths[0]), "first")
+		if err != nil {
 			t.Fatal(err)
 		}
-		if paths[1] == "file.part" {
-			first = filepath.Join(root, "file") + ".part"
-			seen = map[string]string{}
-			if err := reserveDownloadPath(seen, first, "partial"); err != nil {
-				t.Fatal(err)
-			}
+		second, err := reserveFilePath(seen, filepath.Join(root, paths[1]), "second")
+		if err != nil {
+			t.Fatal(err)
 		}
-		if err := reserveDownloadPath(seen, second, "second"); err == nil {
-			t.Fatalf("portable collision %q and %q was accepted", paths[0], paths[1])
+		// Both nodes must stay downloadable, and neither may share a destination or
+		// a .part sidecar with the other on any supported filesystem.
+		for _, pair := range [][2]string{
+			{first, second},
+			{first + ".part", second},
+			{first, second + ".part"},
+			{first + ".part", second + ".part"},
+		} {
+			if portableDownloadPathKey(pair[0]) == portableDownloadPathKey(pair[1]) {
+				t.Fatalf("%q and %q still collide: %q vs %q", paths[0], paths[1], pair[0], pair[1])
+			}
 		}
 	}
 }
@@ -722,6 +844,296 @@ func TestSafeName(t *testing.T) {
 		if got == name || strings.HasSuffix(got, ".") || strings.HasSuffix(got, " ") {
 			t.Fatalf("unsafe portable name %q was mapped to %q", name, got)
 		}
+	}
+}
+
+func TestPromptsShareOneStdinReader(t *testing.T) {
+	original := stdinReader
+	t.Cleanup(func() { stdinReader = original })
+	stdinReader = bufio.NewReader(strings.NewReader("user@example.com\nhunter2\n"))
+
+	email, err := promptLine("email: ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email != "user@example.com" {
+		t.Fatalf("email = %q", email)
+	}
+	// A per-prompt bufio.Reader would have swallowed this in the first read-ahead.
+	password, err := promptSecret("password: ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if password != "hunter2" {
+		t.Fatalf("password = %q, want the second piped line", password)
+	}
+}
+
+func TestPasswordToPersist(t *testing.T) {
+	saved := savedConfig{Account: savedAccount{Email: "user@example.com", Password: "stored"}}
+	none := savedConfig{Account: savedAccount{Email: "user@example.com"}}
+
+	tests := []struct {
+		name               string
+		cfg                savedConfig
+		email              string
+		savePassword       bool
+		passwordFromConfig bool
+		want               string
+	}{
+		{"explicit opt-in", none, "user@example.com", true, false, "fresh"},
+		{"no opt-in and nothing stored", none, "user@example.com", false, false, ""},
+		{"reused stored password", saved, "user@example.com", false, true, "fresh"},
+		{"re-login keeps an existing saved password", saved, "USER@Example.com ", false, false, "fresh"},
+		{"switching accounts drops it", saved, "other@example.com", false, false, ""},
+	}
+	for _, tt := range tests {
+		got := passwordToPersist(tt.cfg, tt.email, "fresh", tt.savePassword, tt.passwordFromConfig)
+		if got != tt.want {
+			t.Fatalf("%s: passwordToPersist = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestGenerateHashcashTokenBoundsTheSearch(t *testing.T) {
+	original := hashcashMaxAttempts
+	t.Cleanup(func() { hashcashMaxAttempts = original })
+	hashcashMaxAttempts = 8
+
+	token := b64Encode(bytes.Repeat([]byte{0x5c}, 48))
+	// easiness 0 -> threshold 8, i.e. ~1 in 537 million; the budget must run out.
+	if _, err := generateHashcashToken("1:0:1700000000:" + token); err == nil {
+		t.Fatal("an unsolvable hashcash challenge did not return an error")
+	}
+	for _, challenge := range []string{"1:999:1700000000:" + token, "1:-1:1700000000:" + token} {
+		if _, err := generateHashcashToken(challenge); err == nil {
+			t.Fatalf("out-of-range easiness %q was accepted", challenge)
+		}
+	}
+}
+
+func TestSanitizeHTTPErrorKeepsUnrelatedText(t *testing.T) {
+	u, err := url.Parse("https://example.test/cs/g?x=capability-secret-value&fn=e&pw=password-secret-value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sanitizeHTTPError(errors.New("dial tcp 10.0.0.1:443: connect: connection refused"), u).Error()
+	// A one-character fn= value must not be redacted out of every word in the message.
+	if !strings.Contains(got, "connection refused") {
+		t.Fatalf("short query value shredded the error text: %s", got)
+	}
+	for _, secret := range []string{"capability-secret-value", "password-secret-value"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("sanitized error leaks %q: %s", secret, got)
+		}
+	}
+}
+
+// downloadTestNode publishes data through a fake transfer API and returns the node
+// describing it, with transferAPI pointed at the test server for the duration.
+func downloadTestNode(t *testing.T, data []byte, handler http.HandlerFunc) transferNode {
+	t.Helper()
+	ukey := []uint32{0x21222324, 0x25262728, 0x292a2b2c, 0x2d2e2f30, 0x31323334, 0x35363738}
+	macs, err := chunkMACs(bytes.NewReader(data), ukey, getChunkSizes(int64(len(data))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileKey, err := buildFileKey(ukey, macs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	original := transferAPI
+	transferAPI = server.URL
+	t.Cleanup(func() { transferAPI = original })
+	return transferNode{H: "nodehandle", Name: "payload.bin", S: int64(len(data)), K: b64Encode(wordsToBytes(fileKey))}
+}
+
+func serveRange(w http.ResponseWriter, r *http.Request, data []byte) {
+	start := int64(0)
+	if rng := r.Header.Get("Range"); rng != "" {
+		if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil || start < 0 || start > int64(len(data)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(data)-1, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+	}
+	_, _ = w.Write(data[start:])
+}
+
+func TestDownloadNodeRetriesTransientFailuresAndResumes(t *testing.T) {
+	data := make([]byte, 300000)
+	for i := range data {
+		data[i] = byte((i*13 + 3) & 0xff)
+	}
+	var mu sync.Mutex
+	attempts := 0
+	node := downloadTestNode(t, data, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		switch attempt {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("busy"))
+		case 2:
+			// Declare the full length but close early: a truncated body.
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data[:1000])
+		default:
+			serveRange(w, r, data)
+		}
+	})
+
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := downloadNode(root, "transferhandle", "", node, "payload.bin", "payload.bin"); err != nil {
+		t.Fatalf("download did not recover from transient failures: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root.Name(), "payload.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 3 {
+		t.Fatalf("server saw %d attempts, want 3 (503, truncated, resumed)", attempts)
+	}
+}
+
+func TestDownloadNodeRestartsWhenResumeIsRejected(t *testing.T) {
+	data := make([]byte, 200000)
+	for i := range data {
+		data[i] = byte((i*7 + 5) & 0xff)
+	}
+	var mu sync.Mutex
+	sawRange := false
+	node := downloadTestNode(t, data, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			mu.Lock()
+			sawRange = true
+			mu.Unlock()
+			// A proxy that answers a resume with a bogus range.
+			w.Header().Set("Content-Range", "bytes 0-9/10")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:10])
+			return
+		}
+		_, _ = w.Write(data)
+	})
+
+	dir := t.TempDir()
+	// A stale .part forces the resume path on the first attempt.
+	if err := os.WriteFile(filepath.Join(dir, "payload.bin.part"), data[:50000], 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := downloadNode(root, "transferhandle", "", node, "payload.bin", "payload.bin"); err != nil {
+		t.Fatalf("download did not recover from a rejected resume: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "payload.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !sawRange {
+		t.Fatal("expected the first attempt to try resuming")
+	}
+}
+
+func TestPostUploadChunkRetriesTransientStatuses(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		switch attempt {
+		case 1:
+			w.WriteHeader(http.StatusBadGateway)
+		case 2:
+			_, _ = w.Write([]byte("-3"))
+		default:
+			_, _ = w.Write([]byte("completion-handle"))
+		}
+	}))
+	defer server.Close()
+
+	body, err := postUploadChunk(context.Background(), server.URL, 0, []byte("chunk"))
+	if err != nil {
+		t.Fatalf("transient upload failures were not retried: %v", err)
+	}
+	if string(body) != "completion-handle" {
+		t.Fatalf("body = %q", body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestPostUploadChunkDoesNotRetryPermanentFailures(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	if _, err := postUploadChunk(context.Background(), server.URL, 0, []byte("chunk")); err == nil {
+		t.Fatal("a permanent failure was reported as success")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1: permanent failures must not be retried", attempts)
+	}
+}
+
+func TestPostUploadChunkStopsWhenThePoolIsCancelled(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := postUploadChunk(ctx, server.URL, 0, []byte("chunk")); err == nil {
+		t.Fatal("expected an error once the worker pool is cancelled")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// A sibling's failure must not make every worker walk the whole backoff ladder.
+	if attempts > 1 {
+		t.Fatalf("attempts = %d, want at most 1 after cancellation", attempts)
 	}
 }
 

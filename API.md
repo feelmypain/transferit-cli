@@ -1059,6 +1059,12 @@ Per-chunk MAC:
 4. The chunk MAC is the final encrypted 16-byte block.
 5. An empty chunk uses sixteen zero bytes as its MAC.
 
+A zero-length file contributes **no** chunk MAC at all. The upload still posts one
+zero-length chunk to obtain the completion handle, but that chunk's MAC is excluded
+from the condensation below, so an empty file's meta MAC is `[0, 0]`. Condensing the
+synthetic chunk instead would yield `AES(k, 0)` and disagree with every other MEGA
+client.
+
 After all chunks are uploaded, combine the chunk MACs:
 
 1. Start with a 16-byte zero block.
