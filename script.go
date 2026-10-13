@@ -2159,6 +2159,8 @@ func setTransferRecipient(api *apiClient, xh, email string, schedule int64) erro
 	req := map[string]any{"a": "xr", "xh": xh, "e": email}
 	if schedule > 0 {
 		req["s"] = schedule
+	} else {
+		req["s"] = 0
 	}
 	var res []json.RawMessage
 	if err := api.call([]map[string]any{req}, nil, &res); err != nil {
