@@ -3,7 +3,7 @@
 This document describes the transfer.it protocol as implemented by this
 repository. It is not an official transfer.it document. The behavior was
 reverse-engineered from the web client and confirmed by the Go implementation
-in `script.go`.
+in this repository.
 
 transfer.it uses MEGA-style APIs and MEGA-style client-side crypto primitives.
 Most JSON API calls go through the `/cs` command endpoint, while file bytes use
@@ -29,7 +29,7 @@ https://bt7.api.mega.co.nz
 listing, file download, transfer creation, folder creation, and upload
 management.
 
-In `script.go`, these are the constants:
+In `main.go`, these base URLs are defined as:
 
 ```go
 const (
@@ -78,7 +78,7 @@ POST /cs?id=<request-id>&x=<transfer-handle>&pw=<password-token>
 The `id` value only needs to be unique-ish per request. The Go code uses the
 current Unix millisecond timestamp plus a local sequence counter.
 
-See `apiClient.call` in `script.go`.
+See `apiClient.call` in `api.go`.
 
 ### Error Handling
 
@@ -198,7 +198,7 @@ Serialized bytes are:
 bigendian(k0) || bigendian(k1) || bigendian(k2) || bigendian(k3)
 ```
 
-See `wordsToBytes` and `bytesToWords` in `script.go`.
+See `wordsToBytes` and `bytesToWords` in `crypto.go`.
 
 ### Transfer Handles and Node Handles
 
@@ -291,7 +291,7 @@ Known fields:
 The title and message are not encrypted in the public metadata response. Decode
 them with raw URL-safe base64 and interpret the result as UTF-8.
 
-Implemented by `getTransferInfo` in `script.go`.
+Implemented by `getTransferInfo` in `download.go`.
 
 ### Password Token Derivation
 
@@ -326,7 +326,7 @@ key := pbkdf2SHA256([]byte(strings.TrimSpace(password)), salt, 100000, 32)
 token := base64.RawURLEncoding.EncodeToString(key)
 ```
 
-Implemented by `deriveTransferPassword` in `script.go`.
+Implemented by `deriveTransferPassword` in `crypto.go`.
 
 ### `xv`: Validate Password Token
 
@@ -359,7 +359,7 @@ Invalid password responses are usually negative, commonly `[-14]`.
 The CLI validates the password before node listing so the user gets a direct
 "invalid transfer password" error instead of a later node-fetch failure.
 
-Implemented by `validateTransferPassword` in `script.go`.
+Implemented by `validateTransferPassword` in `download.go`.
 
 ### `f`: Fetch Transfer Node Tree
 
@@ -436,8 +436,8 @@ Important response fields:
 After `f`, the client decrypts each node's attributes to get the display name.
 Then it reconstructs paths by walking `p` parent links back toward the root.
 
-Implemented by `fetchNodes`, `decryptNodeName`, and `buildNodePath` in
-`script.go`.
+Implemented by `fetchNodes` and `buildNodePath` in `download.go`, and
+`decryptNodeName` in `crypto.go`.
 
 ### Node Attribute Decryption
 
@@ -479,7 +479,7 @@ For root transfer folders created by this CLI, the JSON includes a timestamp:
 ```
 
 Implemented by `decryptNodeName`, `encryptAttr`, and `attrAESKey` in
-`script.go`.
+`crypto.go`.
 
 ### `GET /cs/g`: Download File Bytes
 
@@ -530,7 +530,7 @@ Important behavior:
   trigger transfer.it or MEGA edge anti-abuse/rate-limit behavior.
 
 Implemented by `downloadNode`, `downloadNodeBytes`, and `verifyDownloadedFile`
-in `script.go`.
+in `download.go`.
 
 ## Upload API
 
@@ -601,7 +601,7 @@ base64url_no_padding(ssc || AES-ECB(masterKey, ssc))
 Go does not expose AES-ECB as a mode. The code implements the needed ECB block
 operation by calling `block.Encrypt` or `block.Decrypt` on each 16-byte block.
 
-Implemented by `createAnonymousSession` and `encryptWords` in `script.go`.
+Implemented by `createAnonymousSession` in `account.go` and `encryptWords` in `crypto.go`.
 
 ### `us`: Start Anonymous Session
 
@@ -650,7 +650,7 @@ All upload and transfer-management calls after this point include:
 &sid=<sid>
 ```
 
-Implemented by `createAnonymousSession` and `decryptWords` in `script.go`.
+Implemented by `createAnonymousSession` in `account.go` and `decryptWords` in `crypto.go`.
 
 ### Account Login: `us0` and `us`
 
@@ -796,8 +796,8 @@ transfer creation returns API error `-15` for an invalid saved session, the CLI
 refreshes the login, saves the new session, and retries transfer creation.
 
 Implemented by `loginMegaAccount`, `getMegaLoginMethod`,
-`completeMegaLogin`, `sidFromCSID`, `generateHashcashToken`, and the account
-config helpers in `script.go`.
+`completeMegaLogin`, and the account config helpers in `account.go`, plus
+`sidFromCSID` and `generateHashcashToken` in `crypto.go`.
 
 ### `xn`: Create Transfer Root
 
@@ -846,7 +846,7 @@ The resulting public link is:
 https://transfer.it/t/<transfer-handle>
 ```
 
-Implemented by `createTransfer` in `script.go`.
+Implemented by `createTransfer` in `upload.go`.
 
 ### `xp`: Create Folder Nodes
 
@@ -916,7 +916,7 @@ folder nodes first, and stores a map from relative path to remote folder handle.
 Empty directories are preserved because folder nodes are created even when they
 contain no files.
 
-Implemented by `createRemoteFolders` and `createRemoteFolder` in `script.go`.
+Implemented by `createRemoteFolders` and `createRemoteFolder` in `upload.go`.
 
 ### `u`: Request Upload URL
 
@@ -958,7 +958,7 @@ Fields:
 The returned `p` URL is not a `/cs` endpoint. File chunks are posted directly
 to it.
 
-Implemented by `uploadFile` in `script.go`.
+Implemented by `uploadFile` in `upload.go`.
 
 ### Upload Chunk POST
 
@@ -1012,8 +1012,8 @@ treat every upload response body starting with `-` as an error. Treat it as an
 API error only when the whole response body is a negative integer, such as
 `-3`.
 
-Implemented by `getChunkSizes`, `uploadChunks`, `postUploadChunk`, and
-`uploadFile` in `script.go`.
+Implemented by `uploadChunks` and `uploadFile` in `upload.go`, `getChunkSizes`
+in `crypto.go`, and `postUploadChunk` in `api.go`.
 
 ### File Upload Encryption
 
@@ -1095,7 +1095,7 @@ The final eight-word file key is:
 
 This final file key is what is stored in the transfer node's `k` field.
 
-Implemented by `encryptUploadChunk` and `buildFileKey` in `script.go`.
+Implemented by `encryptUploadChunk`, `encryptChunkInto`, and `buildFileKey` in `crypto.go`.
 
 ### `xp`: Finalize File Node
 
@@ -1164,7 +1164,7 @@ For transfer.it uploads, the file key is stored directly as raw base64url key
 material. This is different from normal logged-in MEGA node storage, where node
 keys may be encrypted to the user's master key.
 
-Implemented by `uploadFile` in `script.go`.
+Implemented by `uploadFile` in `upload.go`.
 
 ### `xm`: Set Transfer Metadata
 
@@ -1219,7 +1219,7 @@ Expiry values used by the UI and CLI:
 The CLI's `--expire 0` means "omit `e`". Its default is `--expire 90`, so by
 default it sends `e: 7776000`.
 
-Implemented by `setTransferOptions` in `script.go`.
+Implemented by `setTransferOptions` in `upload.go`.
 
 ### `xr`: Add Recipient / Send Files
 
@@ -1268,7 +1268,7 @@ it prevents the backend from sending the recipient email.
 The CLI calls `xr` once per recipient. A non-negative response is treated as
 success. A negative response is treated as failure.
 
-Implemented by `setTransferRecipient` and `parseSchedule` in `script.go`.
+Implemented by `setTransferRecipient` in `upload.go` and `parseSchedule` in `util.go`.
 
 ### `xc`: Close / Finalize Transfer
 
@@ -1306,7 +1306,7 @@ Call this after:
 After `xc`, the public link is ready and recipient emails are queued by the
 service.
 
-Implemented by `closeTransfer` in `script.go`.
+Implemented by `closeTransfer` in `upload.go`.
 
 ## End-to-End Download Flow
 

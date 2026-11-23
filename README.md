@@ -5,10 +5,11 @@ A standalone Go command-line tool for downloading from and uploading to
 
 The repository contains:
 
-- `script.go`: the complete Go source code.
-- `script_test.go`: regression tests for parsing, crypto helpers, chunk sizing,
-  and API error parsing.
-- `go.mod`: module metadata and the Unicode normalization dependency.
+- `main.go`, `download.go`, `upload.go`, `account.go`, `api.go`, `crypto.go`,
+  `util.go`: the Go CLI source code (`package main`).
+- `*_test.go`: regression and fuzz tests for downloads, uploads, account config,
+  API error/retry handling, crypto, and path/CLI utilities.
+- `go.mod`: module metadata and dependencies (`golang.org/x/text`, `golang.org/x/term`).
 - `README.md`: user guide.
 - `API.md`: developer notes for the reverse-engineered transfer.it/MEGA API.
 
@@ -82,15 +83,16 @@ CGO_ENABLED=0 go build -trimpath -buildvcs=true -o transferit .
 To run from source without building:
 
 ```bash
-go run script.go --help
+go run . --help
 ```
 
-The code requires Go 1.26.5 or newer. Its only external dependency is
-`golang.org/x/text`, used for portable Unicode filename collision checks.
+The code requires Go 1.26.5 or newer. Its external dependencies are
+`golang.org/x/text` (portable Unicode filename collision checks) and
+`golang.org/x/term` (cross-platform secret password prompts).
 
 ## Commands
 
-The tool has two modes:
+The tool has three commands:
 
 - `download`: download a transfer.it link.
 - `upload`: upload files or directories and create a transfer.it link.
