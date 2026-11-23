@@ -1236,7 +1236,7 @@ Payload without schedule:
   {
     "a": "xr",
     "xh": "<transfer-handle>",
-    "e": "recipient@example.com"
+    "e": "recipient@example.com",
     "s": 0
   }
 ]
@@ -1260,7 +1260,10 @@ Fields:
 | Field | Meaning |
 | --- | --- |
 | `e` | Recipient email address from "Email to" |
-| `s` | Unix timestamp in seconds for "Send date and time" (set to `0` if upload without schedule)|
+| `s` | Unix timestamp in seconds for "Send date and time", or `0` to send immediately |
+
+Always include `s` (set to `0` when unscheduled), matching the web client; omitting
+it prevents the backend from sending the recipient email.
 
 The CLI calls `xr` once per recipient. A non-negative response is treated as
 success. A negative response is treated as failure.

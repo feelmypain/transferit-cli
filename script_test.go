@@ -8,6 +8,7 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -821,6 +822,51 @@ func TestAPICallReturnsNegativeArrayCode(t *testing.T) {
 	var apiErr apiError
 	if !errors.As(err, &apiErr) || apiErr.Code != -15 {
 		t.Fatalf("err = %v, want apiError -15", err)
+	}
+}
+
+func TestSetTransferRecipientAlwaysIncludesScheduleField(t *testing.T) {
+	tests := []struct {
+		name     string
+		schedule int64
+		wantS    float64
+	}{
+		{"unscheduled sends s=0", 0, 0},
+		{"negative schedule clamps to s=0", -5, 0},
+		{"scheduled sends timestamp", 1893456000, 1893456000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Errorf("decode request body: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte("[0]"))
+			}))
+			defer server.Close()
+
+			if err := setTransferRecipient(&apiClient{base: server.URL}, "xh123", "recipient@example.com", tt.schedule); err != nil {
+				t.Fatalf("setTransferRecipient returned error: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("sent %d commands, want 1", len(got))
+			}
+			req := got[0]
+			if req["a"] != "xr" || req["xh"] != "xh123" || req["e"] != "recipient@example.com" {
+				t.Fatalf("unexpected xr payload: %#v", req)
+			}
+			rawS, ok := req["s"]
+			if !ok {
+				t.Fatalf("xr payload omitted required 's' field: %#v", req)
+			}
+			if rawS != tt.wantS {
+				t.Fatalf("xr payload s = %#v, want %v", rawS, tt.wantS)
+			}
+		})
 	}
 }
 
